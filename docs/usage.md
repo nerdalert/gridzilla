@@ -202,15 +202,38 @@ gridzilla serve --handoff /absolute/path/to/handoff.json \
   --runs-dir evidence --host 127.0.0.1 --port 8765 --allow-controls
 ```
 
+The queue signal is shown as `current / capacity`. The numerator is the live
+EPP `llm_d_epp_average_queue_size` metric (average waiting requests per
+endpoint); the denominator is `InferenceProvider.metricsConfig.queueCapacity`,
+which Grid uses to normalize its `queueDepth` score. It is a score scale, not a
+hard queue limit.
+
+The explicitly enabled UI also offers temporary pressure buttons for the one
+provider marked `pressureTarget`: half of its configured capacity and the
+full capacity (for example, `2 / 4` and `4 / 4`). These update only the marked
+llm-d-sim `waiting-requests` signal; they do not enqueue real requests or run
+k6. Gridzilla captures the complete simulator configuration, waits for fresh
+EPP metrics and a serving overlay revision, and sends correlated baseline,
+pressure, and recovery probes. It restores the original simulator settings
+automatically after 30 seconds, or sooner when “Restore baseline now” is
+clicked. The saved `pressure-result.json` records the transition and restore
+proof. A pressure operation cannot overlap a benchmark.
+
+The timeline label “Baseline routing recovered” (the saved boundary name is
+`recovery-complete`) means the captured simulator signal is back, EPP and Grid
+have recomputed the baseline decision, the Gateway is serving the recovered
+overlay revision, and a correlated request has followed the baseline route.
+
 The UI offers only the bundled `smoke`, `baseline`, and `stepped` profiles.
-Starting requires a fresh server-side readiness and provenance check. The
-browser cannot supply arbitrary profile paths, simulator settings, shell
-commands, or credentials. Starting and stopping both require confirmation.
-“Stop safely” interrupts traffic, then restores the saved simulator
-configuration and verifies EPP/Grid/overlay/Gateway recovery before
-completion. Ctrl-C and SIGTERM use the same restoration path. The dashboard
-uses the same bounded runner and evidence format as `gridzilla run`;
-completed results open in Saved runs and render the saved report and charts.
+Starting a benchmark or pressure operation requires a fresh server-side
+readiness and provenance check. The browser cannot supply arbitrary profile
+paths, simulator settings, shell commands, or credentials. Benchmark start and
+stop require confirmation. “Stop safely” interrupts traffic, then restores the
+saved simulator configuration and verifies EPP/Grid/overlay/Gateway recovery
+before completion. Ctrl-C and SIGTERM use the same restoration path. The
+dashboard benchmark uses the same runner and evidence format as
+`gridzilla run`; completed benchmark results open in Saved runs and render the
+saved report and charts.
 
 Controls accept same-origin requests from the loopback dashboard only. The
 server binds to `127.0.0.1`; do not expose it through a public interface or

@@ -9,9 +9,9 @@ function liveState(overrides = {}) {
     return {
       name,
       status: "LIVE",
-      provider: { resource: `InferenceProvider/${name}`, available: true, status: "READY" },
+      provider: { resource: `InferenceProvider/${name}`, available: true, status: "READY", queueCapacity: 4 },
       metrics: {
-        queue: [{ value: index }],
+        queue: [{ name: "llm_d_epp_average_queue_size", labels: { name: `pool-${name}` }, value: index }],
         readyEndpoints: [{ value: 2 }],
         sampleAgeSeconds: 1.5,
         status: "LIVE",
@@ -82,6 +82,15 @@ async function mockApi(page, { live = liveState(), runs = [], saved = null } = {
       await route.fulfill({ status: 202, json: { accepted: true, profile: request.postDataJSON().profile } });
     } else if (url.pathname === "/api/stop" && request.method() === "POST") {
       await route.fulfill({ status: 202, json: { accepted: true, restoration: "Gridzilla will restore simulator state" } });
+    } else if (url.pathname === "/api/pressure" && request.method() === "POST") {
+      const { value } = request.postDataJSON();
+      live.controls = { ...live.controls, running: true, operation: "pressure",
+        pressure: { phase: "accepted", value, capacity: 4, restorationVerified: null } };
+      await route.fulfill({ status: 202, json: { accepted: true, value, capacity: 4, site: "alpha", pool: "pool-alpha" } });
+    } else if (url.pathname === "/api/pressure/restore" && request.method() === "POST") {
+      live.controls = { ...live.controls, running: false, operation: null, stopRequested: false,
+        pressure: { ...live.controls.pressure, phase: "restored", outcome: "PASS", restorationVerified: true } };
+      await route.fulfill({ status: 202, json: { accepted: true, restoration: "Baseline restoration and routing recovery verification started" } });
     } else if (url.pathname === "/api/runs") {
       await route.fulfill({ json: runs });
     } else if (url.pathname.startsWith("/api/runs/")) {
@@ -99,7 +108,7 @@ test("live view presents three ready sites and keeps simulator controls disabled
   await page.goto("/");
 
   await expect(page.getByTestId("live-badge")).toHaveText("LIVE");
-  await expect(page.getByTestId("benchmark-progress")).toContainText("pressure-measurement");
+  await expect(page.getByTestId("benchmark-progress")).toContainText("pressure measurement");
   await expect(page.getByTestId("benchmark-progress")).toContainText("7/16 windows complete");
   await expect(page.getByTestId("site-card-alpha")).toBeVisible();
   await expect(page.getByTestId("site-card-alpha")).toContainText("Simulator pods");
@@ -122,24 +131,69 @@ test("live metrics with no source timestamp do not claim the sample is old", asy
   await mockApi(page, { live });
   await page.goto("/");
 
-  const waitingMetric = page.getByTestId("site-card-alpha").getByTestId("metric-waiting-requests");
-  await expect(waitingMetric).toContainText("LIVE");
-  await expect(waitingMetric).toContainText("sample age unavailable");
-  await expect(waitingMetric).not.toContainText("old");
+  const queueMetric = page.getByTestId("site-card-alpha").getByTestId("metric-queue-signal");
+  await expect(queueMetric).toContainText("0 / 4");
+  await expect(queueMetric).toContainText("llm_d_epp_average_queue_size");
+  await expect(queueMetric).toContainText("not a hard queue limit");
+  await expect(queueMetric).toContainText("LIVE");
+  await expect(queueMetric).toContainText("sample age unavailable");
+  await expect(queueMetric).not.toContainText("old");
+});
+
+test("queue ratio never displays a missing score scale as zero", async ({ page }) => {
+  const live = liveState();
+  live.sites[0].provider.queueCapacity = null;
+  live.sites[0].provider.queueCapacityMatches = false;
+  await mockApi(page, { live });
+  await page.goto("/");
+
+  const queueMetric = page.getByTestId("site-card-alpha").getByTestId("metric-queue-signal");
+  await expect(queueMetric).toContainText("0 / ?");
+  await expect(queueMetric).toContainText("UNAVAILABLE");
+  await expect(queueMetric).not.toContainText("0 / 0");
 });
 
 test("explicitly enabled local controls start only a listed profile", async ({ page }) => {
   const live = liveState({controls:{enabled:true,profiles:["smoke","baseline","stepped"],running:false,
-    profile:null,stopRequested:false,lastOutcome:null,lastRunId:null}});
+    operation:null,pressureOptions:[{value:2,label:"2 / 4",capacity:4,site:"alpha",pool:"pool-alpha"},
+      {value:4,label:"4 / 4",capacity:4,site:"alpha",pool:"pool-alpha"}],
+    pressure:{phase:"idle",restorationVerified:null},profile:null,stopRequested:false,lastOutcome:null,lastRunId:null}});
   const calls = await mockApi(page, { live });
   page.on("dialog", dialog => dialog.accept());
   await page.goto("/");
 
-  await expect(page.getByTestId("benchmark-controls")).toContainText("Run a bounded performance profile");
+  await expect(page.getByTestId("benchmark-controls")).toContainText("Run a performance profile");
+  await expect(page.getByTestId("benchmark-controls")).not.toContainText("Run a bounded performance profile");
+  const controlsBeforeHero = await page.getByTestId("benchmark-controls").evaluate(element => {
+    const hero = document.querySelector(".hero");
+    return Boolean(hero && (element.compareDocumentPosition(hero) & Node.DOCUMENT_POSITION_FOLLOWING));
+  });
+  expect(controlsBeforeHero, "the run controls should appear before the live dashboard summary").toBeTruthy();
+  await expect(page.getByTestId("pressure-2")).toContainText("Apply 2 / 4");
+  await expect(page.getByTestId("pressure-4")).toContainText("Apply 4 / 4");
   await page.getByLabel("Profile").selectOption("baseline");
   await page.getByTestId("start-benchmark").click();
   await expect(page.getByRole("status")).toContainText("baseline accepted");
   expect(calls.some(call => call.method === "POST" && call.url.endsWith("/api/run") && call.body?.profile === "baseline"))
+    .toBeTruthy();
+});
+
+test("temporary queue pressure requests only an offered level and exposes early restore", async ({ page }) => {
+  const live = liveState({controls:{enabled:true,profiles:["smoke","baseline","stepped"],running:false,
+    operation:null,pressureOptions:[{value:2,label:"2 / 4",capacity:4,site:"alpha",pool:"pool-alpha"},
+      {value:4,label:"4 / 4",capacity:4,site:"alpha",pool:"pool-alpha"}],
+    pressure:{phase:"idle",restorationVerified:null}}});
+  const calls = await mockApi(page, { live });
+  await page.goto("/");
+
+  await page.getByTestId("pressure-2").click();
+  await expect(page.getByTestId("restore-pressure")).toBeEnabled();
+  await expect(page.getByTestId("pressure-state")).toContainText("accepted · 2 / 4");
+  await page.getByTestId("restore-pressure").click();
+  await expect(page.getByTestId("pressure-state")).toContainText("restored · 2 / 4 · PASS · baseline restored");
+  expect(calls.some(call => call.method === "POST" && call.url.endsWith("/api/pressure") && call.body?.value === 2))
+    .toBeTruthy();
+  expect(calls.some(call => call.method === "POST" && call.url.endsWith("/api/pressure/restore")))
     .toBeTruthy();
 });
 
@@ -187,9 +241,10 @@ test("pressure and recovery boundaries are visible without exposing mutation con
   const calls = await mockApi(page, { live: pressure });
   await page.goto("/");
 
-  await expect(page.getByTestId("signal-timeline")).toContainText("simulator-pressure-applied");
-  await expect(page.getByTestId("signal-timeline")).toContainText("grid-selection-shift");
-  await expect(page.getByTestId("signal-timeline")).toContainText("recovery-complete");
+  await expect(page.getByTestId("signal-timeline")).toContainText("Temporary simulator pressure applied");
+  await expect(page.getByTestId("signal-timeline")).toContainText("Grid selected another provider");
+  await expect(page.getByTestId("signal-timeline")).toContainText("Baseline routing recovered");
+  await expect(page.locator(".hero")).toContainText("Baseline routing recovered");
   await expect(page.getByTestId("signal-timeline")).toContainText("RECOVERED");
   await expect(page.getByTestId("control-disabled").getByRole("button")).toHaveCount(2);
   expect(calls.every(call => call.method === "GET")).toBeTruthy();
@@ -210,7 +265,7 @@ test("saved run mode renders offline evidence and historical signal boundaries",
   await expect(page.getByTestId("route-distribution")).toContainText("8");
   await expect(page.getByTestId("route-distribution")).toContainText("Attributed / HTTP");
   await expect(page.getByTestId("route-distribution")).toContainText("pressure");
-  await expect(page.getByTestId("saved-timeline")).toContainText("simulator-pressure-applied");
+  await expect(page.getByTestId("saved-timeline")).toContainText("Temporary simulator pressure applied");
   const evidenceLink = page.getByRole("link", { name: "run-result.json" });
   await expect(evidenceLink).toHaveAttribute("href", "/api/runs/grid-signals-demo-20261109T120000Z/files/run-result.json");
   expect(calls.every(call => call.method === "GET")).toBeTruthy();
@@ -245,4 +300,5 @@ test("active benchmark evidence remains inspectable in saved-run mode", async ({
   await page.getByRole("button", { name: "Saved runs" }).click();
   await expect(page.getByTestId("saved-run-detail")).toContainText("RUNNING");
   await expect(page.getByTestId("saved-run-detail")).toContainText("7/16 windows complete");
+  await expect(page.getByTestId("benchmark-progress")).toContainText("pressure measurement");
 });

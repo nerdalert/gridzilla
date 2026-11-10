@@ -3,6 +3,15 @@ import { useCallback, useEffect, useState } from "react";
 const ageText = value => Number.isFinite(value) ? `${value.toFixed(1)}s old` : "sample age unavailable";
 const formatNumber = value => Number.isFinite(Number(value)) ? Number(value).toFixed(2) : "UNAVAILABLE";
 const shortRevision = value => value ? (String(value).length > 24 ? `${String(value).slice(0, 12)}…${String(value).slice(-7)}` : value) : "UNAVAILABLE";
+const boundaryLabels = {
+  "simulator-pressure-applied": "Temporary simulator pressure applied",
+  "epp-fresh-sample": "Fresh EPP signal observed",
+  "grid-selection-shift": "Grid selected another provider",
+  "grid-overlay-and-gateway": "Overlay and Gateway revisions converged",
+  "simulator-metrics-restored": "Simulator signal restored",
+  "recovery-complete": "Baseline routing recovered",
+};
+const boundaryLabel = value => boundaryLabels[value] || String(value || "Unknown event").replaceAll("-", " ");
 
 function Badge({ value, testId }) {
   const normalized = ["LIVE", "READY", "PASS", "RECOVERED"].includes(value) ? "live" :
@@ -10,10 +19,11 @@ function Badge({ value, testId }) {
   return <span className={`badge ${normalized}`} data-testid={testId}>{value || "UNAVAILABLE"}</span>;
 }
 
-function Metric({ label, value, unit = "", status = "LIVE", age }) {
+function Metric({ label, value, unit = "", status = "LIVE", age, description }) {
   return <div className="metric" data-testid={`metric-${label.toLowerCase().replaceAll(" ", "-")}`}>
     <span>{label}</span>
     <strong>{value === null || value === undefined ? "UNAVAILABLE" : `${value}${unit}`}</strong>
+    {description && <small className="metric-description">{description}</small>}
     <small><Badge value={status} /> {age !== undefined && <span>{ageText(age)}</span>}</small>
   </div>;
 }
@@ -43,14 +53,22 @@ function PoolCard({ site }) {
   const metric = site.metrics || {};
   const queue = metric.queue?.[0]?.value;
   const ready = metric.readyEndpoints?.[0]?.value;
+  const queueCapacity = site.provider?.queueCapacity;
+  const queueNumber = Number(queue);
+  const capacityNumber = Number(queueCapacity);
+  const queueAvailable = queue != null && Number.isFinite(queueNumber);
+  const capacityAvailable = queueCapacity != null && Number.isFinite(capacityNumber) && capacityNumber > 0 && site.provider?.queueCapacityMatches !== false;
+  const queueValue = queueAvailable ? `${Number.isInteger(queueNumber) ? queueNumber : queueNumber.toFixed(1)} / ${capacityAvailable ? (Number.isInteger(capacityNumber) ? capacityNumber : capacityNumber.toFixed(1)) : "?"}` : null;
+  const queueStatus = queueAvailable && capacityAvailable ? metric.status || "UNAVAILABLE" : "UNAVAILABLE";
+  const queueMetricName = metric.queue?.[0]?.name || "configured EPP queue metric";
   const imageIdentities = site.resources?.imageIdentities || {};
   return <article className="panel pool-card" data-testid={`site-card-${site.name}`}>
     <div className="panel-title"><div><span className="eyebrow">SITE · {site.name}</span><h2>{site.name}</h2><p>{site.provider?.resource || "Provider identity unavailable"}</p></div><Badge value={site.status || "UNAVAILABLE"} /></div>
     <div className="metrics-grid">
-      <Metric label="Waiting requests" value={queue} unit="" status={metric.status || "UNAVAILABLE"} age={metric.sampleAgeSeconds} />
+      <Metric label="Queue signal" value={queueValue} status={queueStatus} age={metric.sampleAgeSeconds}
+        description={`Live EPP ${queueMetricName}: average waiting requests per endpoint. The denominator is queueCapacity, Grid's scoring scale, not a hard queue limit.`} />
       <Metric label="Ready endpoints" value={ready} status={ready > 0 ? "LIVE" : "UNAVAILABLE"} age={metric.sampleAgeSeconds} />
       <Metric label="Provider" value={site.provider?.available ? "Available" : "Unavailable"} status={site.provider?.status || "UNAVAILABLE"} />
-      <Metric label="Queue capacity" value={site.provider?.queueCapacity ?? null} status={site.provider?.queueCapacityMatches ? "READY" : "UNAVAILABLE"} />
       <Metric label="Simulator pods" value={site.simulators?.length ? `${site.simulators.filter(item=>item.ready && item.adminApiReachable).length}/${site.simulators.length}` : null} status={site.simulators?.length && site.simulators.every(item=>item.ready && item.adminApiReachable) ? "READY" : "UNAVAILABLE"} />
     </div>
     <div className="revision-grid">
@@ -124,10 +142,43 @@ function BenchmarkProgress({ benchmark }) {
   const traffic = benchmark.trafficProgress;
   return <section className="panel benchmark-progress" data-testid="benchmark-progress">
     <div><span className="eyebrow">GRIDZILLA RUN · {benchmark.runId || "unknown"}</span>
-      <h3>{benchmark.phase || "phase unavailable"}</h3>
+      <h3>{boundaryLabel(benchmark.phase || "phase unavailable")}</h3>
       <p>{traffic ? `${traffic.action} · ${traffic.index} · ${traffic.ratePerSecond} req/s · ${traffic.duration}` : "Readiness and signal gates are running before traffic."}</p>
       <small>{traffic ? `${traffic.completedWindows}/${traffic.expectedWindows} windows complete · status updated ${benchmark.updatedAtUtc || "time unavailable"}` : `status updated ${benchmark.updatedAtUtc || "time unavailable"}`}</small>
     </div><Badge value={benchmark.status || "UNAVAILABLE"} />
+  </section>;
+}
+
+function DashboardControls({ controls, controlsReady, startEnabled, selectedProfile, setSelectedProfile,
+                             controlMessage, controlBusy, startBenchmark, stopBenchmark,
+                             applyPressure, restorePressure }) {
+  if (!controls.enabled) return <section className="panel read-only-controls" data-testid="control-disabled">
+    <div><h3>Controller actions are disabled</h3><p>Restart the localhost dashboard with explicit <code>--allow-controls</code> to start a profile.</p></div>
+    <div><button disabled>Start benchmark</button><button disabled>Apply pressure</button></div>
+  </section>;
+
+  const pressure = controls.pressure || {};
+  const pressureRunning = controls.running && controls.operation === "pressure";
+  const pressureOptions = controls.pressureOptions || [];
+  return <section className="panel benchmark-controls" data-testid="benchmark-controls">
+    <div><h3>Run a performance profile</h3>
+      <p>Start runs the selected profile. It applies synthetic queue pressure, verifies the route response, then restores and checks the original state.</p>
+      {controlMessage && <small role="status">{controlMessage}</small>}
+    </div>
+    <div className="control-actions"><label htmlFor="benchmark-profile">Profile</label><select id="benchmark-profile" value={selectedProfile} disabled={!startEnabled}
+      onChange={event=>setSelectedProfile(event.target.value)}>{(controls.profiles || []).map(name=><option key={name} value={name}>{name}</option>)}</select>
+      <button data-testid="start-benchmark" disabled={!startEnabled} onClick={startBenchmark}>{controlBusy ? "Starting…" : "Start benchmark"}</button>
+      <button data-testid="stop-benchmark" disabled={!controls.running || controls.operation !== "benchmark" || controlBusy} onClick={stopBenchmark}>{controls.stopRequested ? "Restoring safely…" : "Stop safely"}</button>
+    </div>
+    {pressureOptions.length > 0 && <div className="signal-pressure-controls" data-testid="signal-pressure-controls">
+      <div><strong>Temporary queue pressure</strong><small>Sets the synthetic average-waiting-request signal for {pressureOptions[0].pool} at {pressureOptions[0].site}; it does not enqueue real requests. Gridzilla restores the captured simulator setting after 30 seconds, or when you choose Restore baseline now.</small>
+        {pressure.phase && pressure.phase !== "idle" && <small data-testid="pressure-state">{pressure.phase}{pressure.value != null ? ` · ${pressure.value} / ${pressure.capacity}` : ""}{pressure.selectedSite ? ` · route selected ${pressure.selectedSite}` : ""}{pressure.outcome ? ` · ${pressure.outcome}` : ""}{pressure.restorationVerified ? " · baseline restored" : ""}{pressure.runId ? ` · evidence ${pressure.runId}` : ""}</small>}</div>
+      <div className="control-actions">{pressureOptions.map(option=><button key={option.value} data-testid={`pressure-${option.value}`}
+        disabled={!controlsReady || controls.running || controlBusy} onClick={()=>applyPressure(option.value)}>
+        {`Apply ${option.label}`}</button>)}
+        <button data-testid="restore-pressure" disabled={!pressureRunning || controlBusy} onClick={restorePressure}>Restore baseline now</button>
+      </div>
+    </div>}
   </section>;
 }
 
@@ -245,6 +296,37 @@ function Gridzilla() {
     }
   };
 
+  const applyPressure = async value => {
+    setControlBusy(true);
+    setControlMessage("Checking readiness and capturing the current simulator configuration…");
+    try {
+      const response = await fetch("/api/pressure", {method:"POST", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({value})});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Pressure request rejected (${response.status})`);
+      await refreshLive();
+      setControlMessage(`Applying ${result.value} / ${result.capacity} temporary queue pressure to ${result.pool} at ${result.site}; Gridzilla will verify route selection and restore the baseline.`);
+    } catch (cause) {
+      setControlMessage(cause instanceof Error ? cause.message : "Pressure request was rejected");
+    } finally {
+      setControlBusy(false);
+    }
+  };
+
+  const restorePressure = async () => {
+    setControlBusy(true);
+    try {
+      const response = await fetch("/api/pressure/restore", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Restore request rejected (${response.status})`);
+      setControlMessage(result.restoration || "Restoration requested; routing recovery will be verified.");
+    } catch (cause) {
+      setControlMessage(cause instanceof Error ? cause.message : "Restore request was rejected");
+    } finally {
+      setControlBusy(false);
+    }
+  };
+
   return <main className="app-shell">
     <header className="topbar"><div className="brand"><span className="brand-mark">G</span><div><strong>GRIDZILLA</strong><small>Signals-based routing performance</small></div></div>
       <nav><button className={mode === "live" ? "active" : ""} onClick={()=>setMode("live")}>Live environment</button><button className={mode === "saved" ? "active" : ""} onClick={()=>setMode("saved")}>Saved runs</button></nav>
@@ -252,7 +334,11 @@ function Gridzilla() {
     </header>
     {error && <div className="alert" role="status">{error}</div>}
     {mode === "live" ? <>
-      <section className="hero panel"><div><span className="eyebrow">{live?.phase || "CONNECTING"}</span><h1>Live Grid + llm-d signal path</h1>
+      <DashboardControls controls={controls} controlsReady={controlsReady} startEnabled={startEnabled}
+        selectedProfile={selectedProfile} setSelectedProfile={setSelectedProfile} controlMessage={controlMessage}
+        controlBusy={controlBusy} startBenchmark={startBenchmark} stopBenchmark={stopBenchmark}
+        applyPressure={applyPressure} restorePressure={restorePressure} />
+      <section className="hero panel"><div><span className="eyebrow">{boundaryLabel(live?.phase || "CONNECTING")}</span><h1>Live Grid + llm-d signal path</h1>
         <p>llm-d-sim → authenticated EPP metrics → Grid score/rank → distributed overlay → Gateway revision → attributed request.</p>
         <small>Synthetic simulator signals are separate from measured Gateway traffic. {controls.enabled ? "Local controls run bounded profiles and restore simulator state." : "This view is read-only and does not create load or modify the cluster."}</small></div>
         <div className="hero-meta"><Badge value={live?.status || "UNAVAILABLE"} /><span>last sample {live?.observedAtUtc ? new Date(live.observedAtUtc).toLocaleTimeString() : "unavailable"}</span><span>source {live?.source?.revision ? `${live.source.revision.slice(0,12)}…` : "unavailable"}</span></div></section>
@@ -267,16 +353,8 @@ function Gridzilla() {
             {!crossSite.sites?.length && <div className="empty">No cross-site snapshot is available.</div>}</div></section>
       </section>
       <section className="panel timeline-panel" data-testid="signal-timeline"><div className="panel-title"><div><h3>Signal-to-route timeline</h3><p>Boundary events use local monotonic durations; timestamps from different clusters may have clock skew.</p></div><Badge value={live?.transition?.status || "UNAVAILABLE"} /></div>
-        <div className="timeline">{(live?.timeline || []).map((item,index)=><div className="timeline-item" key={`${item.boundary}-${index}`}><span className="timeline-dot" /><strong>{item.boundary}</strong><span>{item.observedAtUtc || "time unavailable"}</span><small>{item.durationMs == null ? "duration not measured" : `${formatNumber(item.durationMs)} ms`}</small></div>)}
+        <div className="timeline">{(live?.timeline || []).map((item,index)=><div className="timeline-item" key={`${item.boundary}-${index}`}><span className="timeline-dot" /><strong title={item.boundary}>{boundaryLabel(item.boundary)}</strong><span>{item.observedAtUtc || "time unavailable"}</span><small>{item.durationMs == null ? "duration not measured" : `${formatNumber(item.durationMs)} ms`}</small></div>)}
           {!live?.timeline?.length && <div className="empty">No transition has been run in this attached environment.</div>}</div></section>
-      {controls.enabled ? <section className="panel read-only-controls benchmark-controls" data-testid="benchmark-controls">
-        <div><h3>Run a bounded performance profile</h3><p>Start is enabled only while every simulator, EPP, provider, overlay, and Gateway gate is current. Pressure is synthetic and restoration is verified before completion.</p>
-          {controlMessage && <small role="status">{controlMessage}</small>}</div>
-        <div className="control-actions"><label htmlFor="benchmark-profile">Profile</label><select id="benchmark-profile" value={selectedProfile} disabled={!startEnabled}
-          onChange={event=>setSelectedProfile(event.target.value)}>{(controls.profiles || []).map(name=><option key={name} value={name}>{name}</option>)}</select>
-          <button data-testid="start-benchmark" disabled={!startEnabled} onClick={startBenchmark}>{controlBusy ? "Starting…" : "Start benchmark"}</button>
-          <button data-testid="stop-benchmark" disabled={!controls.running || controlBusy} onClick={stopBenchmark}>{controls.stopRequested ? "Stopping safely…" : "Stop safely"}</button></div>
-      </section> : <section className="panel read-only-controls" data-testid="control-disabled"><div><h3>Controller actions are disabled</h3><p>Restart the localhost dashboard with explicit <code>--allow-controls</code> to start or stop a bounded benchmark.</p></div><div><button disabled>Start benchmark</button><button disabled>Stop safely</button></div></section>}
       <section className="section-heading"><div><span className="eyebrow">RECENT RUNS</span><h2>Saved evidence</h2><p>Browse reports without contacting the clusters.</p></div><button onClick={()=>setMode("saved")}>Open run browser</button></section>
       <RunList runs={runs} onSelect={id=>{setSelectedRun(id);setMode("saved");}} />
     </> : <>
@@ -292,7 +370,7 @@ function Gridzilla() {
           <div className="chart-grid"><LineChart title="Achieved requests / second" labels={chart.labels} values={chart.achievedRps} unit="req/s" testId="saved-throughput-chart"/><LineChart title="p95 response time" labels={chart.labels} values={chart.p95LatencyMs} unit="ms" testId="saved-latency-chart"/><LineChart title="Host available memory" labels={resourceSeries.map(item=>`${item.phase || "sample"} · ${item.observedAtUtc || ""}`)} values={resourceSeries.map(item=>item.hostMemoryAvailableBytes == null ? null : item.hostMemoryAvailableBytes / 1024 / 1024)} unit="MiB" testId="saved-host-memory-chart"/><LineChart title="Cluster CPU sample" labels={resourceSeries.map(item=>`${item.phase || "sample"} · ${item.observedAtUtc || ""}`)} values={resourceSeries.map(item=>item.clusterCpuCores)} unit="cores" testId="saved-cluster-cpu-chart"/></div>
           <RouteBars counts={saved.routeCountsBySite || {}} windows={saved.routeDistributionByWindow || []} />
           <section className="panel" data-testid="saved-timeline"><div className="panel-title"><div><h3>Saved signal boundaries</h3><p>Replayed from evidence; values are historical.</p></div><Badge value="HISTORICAL" /></div>
-            {(saved.signalBoundaries || []).length ? <div className="timeline">{saved.signalBoundaries.map((item,index)=><div className="timeline-item" key={index}><span className="timeline-dot"/><strong>{item.boundary}</strong><span>{item.observedAtUtc || item.time?.utc || "time unavailable"}</span></div>)}</div> : <div className="empty">No signal timeline was saved.</div>}</section>
+            {(saved.signalBoundaries || []).length ? <div className="timeline">{saved.signalBoundaries.map((item,index)=><div className="timeline-item" key={index}><span className="timeline-dot"/><strong title={item.boundary}>{boundaryLabel(item.boundary)}</strong><span>{item.observedAtUtc || item.time?.utc || "time unavailable"}</span></div>)}</div> : <div className="empty">No signal timeline was saved.</div>}</section>
           <section className="panel"><div className="panel-title"><div><h3>Evidence files</h3><p>Download saved run inputs and raw results.</p></div></div>
             {(saved.evidenceFiles || []).length ? <ul className="evidence-files">{saved.evidenceFiles.map(file => <li key={file}>
               <a href={`/api/runs/${encodeURIComponent(saved.runId || selectedRun)}/files/${encodeURIComponent(file)}`}>{file}</a>

@@ -374,6 +374,10 @@ def serve(*, handoff: dict[str, Any] | None, runs_dir: Path, host: str, port: in
                     result = controls.start(str(body.get("profile", "")))
                 elif route == "/api/stop":
                     result = controls.stop()
+                elif route == "/api/pressure":
+                    result = controls.start_pressure(body.get("value"))
+                elif route == "/api/pressure/restore":
+                    result = controls.restore_pressure()
                 else:
                     self._json({"error": "control endpoint not found"}, 404)
                     return
