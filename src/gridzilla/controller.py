@@ -633,6 +633,11 @@ class SignalRestorer:
         self.previous: dict[int, Any] = {}
 
     def __enter__(self) -> "SignalRestorer":
+        # Dashboard-triggered benchmarks run on a worker thread. Python only
+        # permits signal handlers to be changed on the main thread; the
+        # dashboard asks the worker to stop through its stop_event instead.
+        if threading.current_thread() is not threading.main_thread():
+            return self
         for signum in (signal.SIGINT, signal.SIGTERM):
             self.previous[signum] = signal.getsignal(signum)
             signal.signal(signum, self._handle)
@@ -831,12 +836,14 @@ def _check_signal_gate(handoff: dict[str, Any], baseline: dict[str, Any], curren
 
 def wait_for_signal_transition(handoff: dict[str, Any], transport: EndpointTransport, profile: Profile,
                                baseline: dict[str, Any], pressured_site: str, *, timeout_seconds: int = 180,
-                               evidence_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+                               evidence_dir: Path, stop_event: threading.Event | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     started = monotonic_utc_pair()
     deadline = time.monotonic() + timeout_seconds
     polls = 0
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            raise StopRequested("benchmark stop requested by dashboard")
         polls += 1
         try:
             current = gate_snapshot(handoff, transport, max_age_seconds=duration_seconds(profile.freshness_limit, "freshness limit"))
@@ -1079,7 +1086,8 @@ def _directory_size(path: Path) -> int:
 
 
 def run_benchmark(handoff: dict[str, Any], profile: Profile, profile_path: Path, *, root: Path | None = None,
-                  stop_event: threading.Event | None = None) -> dict[str, Any]:
+                  stop_event: threading.Event | None = None,
+                  transport: EndpointTransport | None = None) -> dict[str, Any]:
     handoff = _token_resolved_handoff(handoff)
     stop_event = stop_event or threading.Event()
     if profile.slo and not isinstance(profile.slo, dict):
@@ -1117,8 +1125,10 @@ def run_benchmark(handoff: dict[str, Any], profile: Profile, profile_path: Path,
                       "updatedAtUtc": utc_now()})
         write_json(status_path, state)
 
+    owns_transport = transport is None
     try:
-        transport = _startup_transports(handoff, directory)
+        if transport is None:
+            transport = _startup_transports(handoff, directory)
     except Exception as exc:
         run_lock.close()
         state.update({"phase": "preflight-failed", "status": "FAIL", "failure": str(exc), "updatedAtUtc": utc_now()})
@@ -1200,7 +1210,8 @@ def run_benchmark(handoff: dict[str, Any], profile: Profile, profile_path: Path,
             state.update({"phase": "pressure-convergence", "status": "RUNNING", "updatedAtUtc": utc_now()})
             write_json(status_path, state)
             pressured_gate, pressure_facts = wait_for_signal_transition(handoff, transport, profile, baseline_gate,
-                                                                        pressured_site, evidence_dir=directory)
+                                                                        pressured_site, evidence_dir=directory,
+                                                                        stop_event=stop_event)
             signal_events.append({"boundary": "grid-selection-shift", **pressure_facts})
             expected_pressure_site = _expected_site(_candidate_on_client_site(handoff, pressured_gate), handoff["client"]["attribution"])
             send_probe(handoff, transport, evidence_dir=directory, sequence=1,
@@ -1291,7 +1302,8 @@ def run_benchmark(handoff: dict[str, Any], profile: Profile, profile_path: Path,
                 regenerate_report(directory)
             except Exception as report_exc:
                 write_json(directory / "report-error.json", {"error": str(report_exc), "observedAtUtc": utc_now()})
-            transport.close()
+            if owns_transport:
+                transport.close()
             run_lock.close()
     return {"evidenceDirectory": str(directory), "status": state["status"], "windows": len(windows), "failure": failure}
 

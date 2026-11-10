@@ -177,7 +177,7 @@ saved evidence:
 gridzilla report evidence/<run-directory>
 ```
 
-Open the local read-only dashboard:
+Open the local dashboard in read-only mode:
 
 ```sh
 gridzilla serve --handoff /absolute/path/to/handoff.json \
@@ -193,10 +193,29 @@ gridzilla serve --runs-dir evidence
 
 The live view distinguishes `LIVE`, `STALE`, `UNAVAILABLE`, and historical
 data; separates the local overlay from the cross-site snapshot; and shows
-signal, score/rank, revision, route, and resource state. It is read-only: the
-UI has no pressure, start, stop, or restore controls and never sends
-credentials to the browser. Saved-run mode reads evidence without cluster
-access. The UI is bound to localhost only.
+signal, score/rank, revision, route, and resource state. By default, the UI is
+read-only. To allow it to start bounded benchmarks, explicitly enable local
+controls:
+
+```sh
+gridzilla serve --handoff /absolute/path/to/handoff.json \
+  --runs-dir evidence --host 127.0.0.1 --port 8765 --allow-controls
+```
+
+The UI offers only the bundled `smoke`, `baseline`, and `stepped` profiles.
+Starting requires a fresh server-side readiness and provenance check. The
+browser cannot supply arbitrary profile paths, simulator settings, shell
+commands, or credentials. Starting and stopping both require confirmation.
+“Stop safely” interrupts traffic, then restores the saved simulator
+configuration and verifies EPP/Grid/overlay/Gateway recovery before
+completion. Ctrl-C and SIGTERM use the same restoration path. The dashboard
+uses the same bounded runner and evidence format as `gridzilla run`;
+completed results open in Saved runs and render the saved report and charts.
+
+Controls accept same-origin requests from the loopback dashboard only. The
+server binds to `127.0.0.1`; do not expose it through a public interface or
+reverse proxy. Credentials remain in server-side handoff files and are never
+sent to the browser. Saved-run mode reads evidence without cluster access.
 
 ## Interpreting results and limits
 

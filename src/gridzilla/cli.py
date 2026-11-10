@@ -40,13 +40,17 @@ def _parser() -> argparse.ArgumentParser:
     report_parser = sub.add_parser("report", help="regenerate report and plots from saved evidence only")
     report_parser.add_argument("evidence_directory", type=Path)
 
-    serve_parser = sub.add_parser("serve", help="serve a localhost read-only live and saved-run dashboard")
+    serve_parser = sub.add_parser("serve", help="serve the localhost live and saved-run dashboard")
     serve_parser.add_argument("--handoff", type=Path)
     serve_parser.add_argument("--runs-dir", type=Path, default=Path("evidence"))
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8765)
     serve_parser.add_argument("--refresh-seconds", type=float, default=3.0)
     serve_parser.add_argument("--dist", type=Path)
+    serve_parser.add_argument("--allow-controls", action="store_true",
+                              help="enable local Start/Stop benchmark controls (requires --handoff)")
+    serve_parser.add_argument("--profiles-dir", type=Path,
+                              help="directory containing smoke.json, baseline.json, and stepped.json")
     return parser
 
 
@@ -94,10 +98,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValidationError("Gridzilla UI binds only to 127.0.0.1 to keep cluster credentials local")
             if not 1 <= args.port <= 65535:
                 raise ValidationError("port must be between 1 and 65535")
+            if args.allow_controls and not args.handoff:
+                raise ValidationError("--allow-controls requires --handoff")
             handoff = _handoff(args.handoff) if args.handoff else None
             from .web import serve
             serve(handoff=handoff, runs_dir=args.runs_dir.resolve(), host=args.host, port=args.port,
-                  refresh_seconds=args.refresh_seconds, dist=args.dist)
+                  refresh_seconds=args.refresh_seconds, dist=args.dist, allow_controls=args.allow_controls,
+                  profiles_dir=args.profiles_dir)
             return 0
         raise ValidationError(f"unsupported command {args.command!r}")
     except (ValidationError, BenchmarkFailure, RuntimeErrorChecked, OSError, ValueError) as exc:

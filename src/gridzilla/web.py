@@ -1,9 +1,10 @@
-"""Read-only localhost dashboard API and static UI server."""
+"""Localhost dashboard API and static UI server."""
 
 from __future__ import annotations
 
 import json
 import mimetypes
+import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,8 +12,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from .controls import BenchmarkControls, ControlFailure
 from .controller import _cluster_resources, _startup_transports
-from .models import redacted_handoff
+from .models import ValidationError, redacted_handoff
 from .runtime import EndpointTransport, gate_snapshot, utc_now
 
 
@@ -290,8 +292,23 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
+def _local_control_origin(host_header: str, origin_header: str | None, port: int) -> bool:
+    """Reject cross-origin browser requests to the local control API."""
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    if host_header.lower() not in allowed_hosts:
+        return False
+    if not origin_header:
+        return False
+    try:
+        parsed = urlsplit(origin_header)
+    except ValueError:
+        return False
+    return parsed.scheme == "http" and parsed.netloc.lower() in allowed_hosts and not parsed.path and not parsed.query and not parsed.fragment
+
+
 def serve(*, handoff: dict[str, Any] | None, runs_dir: Path, host: str, port: int,
-          refresh_seconds: float, dist: Path | None = None) -> None:
+          refresh_seconds: float, dist: Path | None = None,
+          allow_controls: bool = False, profiles_dir: Path | None = None) -> None:
     if host != "127.0.0.1":
         raise ValueError("Gridzilla UI must bind only to 127.0.0.1")
     assets = (dist or Path(__file__).resolve().parents[2] / "web" / "dist").resolve()
@@ -299,6 +316,15 @@ def serve(*, handoff: dict[str, Any] | None, runs_dir: Path, host: str, port: in
         raise FileNotFoundError(f"built Gridzilla UI not found at {assets}; run npm run build")
     evidence_root = runs_dir.resolve()
     live = LiveState(handoff, refresh_seconds, evidence_root)
+    try:
+        controls = BenchmarkControls(
+            enabled=allow_controls, handoff=handoff, evidence_root=evidence_root,
+            profiles_dir=profiles_dir or Path(__file__).resolve().parents[2] / "profiles",
+            transport=live.transport,
+        )
+    except Exception:
+        live.close()
+        raise
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "Gridzilla/0.1"
@@ -317,12 +343,51 @@ def serve(*, handoff: dict[str, Any] | None, runs_dir: Path, host: str, port: in
             self.wfile.write(data)
 
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
-            self._json({"error": "Gridzilla UI is read-only"}, 405)
+            route = urlsplit(self.path).path
+            if not controls.enabled:
+                self._json({"error": "Gridzilla UI is read-only; restart with --allow-controls to enable benchmark actions"}, 405)
+                return
+            if not _local_control_origin(self.headers.get("Host", ""), self.headers.get("Origin"), port):
+                self._json({"error": "dashboard controls accept same-origin localhost requests only"}, 403)
+                return
+            if self.headers.get("Transfer-Encoding"):
+                self._json({"error": "chunked control requests are not accepted"}, 411)
+                return
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._json({"error": "invalid Content-Length"}, 400)
+                return
+            if content_length < 0 or content_length > 1024:
+                self._json({"error": "control request body exceeds 1 KiB"}, 413)
+                return
+            try:
+                body = json.loads(self.rfile.read(content_length) or b"{}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._json({"error": "control request must be JSON"}, 400)
+                return
+            if not isinstance(body, dict):
+                self._json({"error": "control request must be a JSON object"}, 400)
+                return
+            try:
+                if route == "/api/run":
+                    result = controls.start(str(body.get("profile", "")))
+                elif route == "/api/stop":
+                    result = controls.stop()
+                else:
+                    self._json({"error": "control endpoint not found"}, 404)
+                    return
+            except ControlFailure as exc:
+                self._json({"error": str(exc)}, exc.status)
+                return
+            self._json(result, 202)
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
             route = urlsplit(self.path).path
             if route == "/api/state":
-                self._json(live.read())
+                value = live.read()
+                value["controls"] = controls.status()
+                self._json(value)
                 return
             if route == "/api/runs":
                 self._json(_saved_runs(evidence_root))
@@ -364,14 +429,29 @@ def serve(*, handoff: dict[str, Any] | None, runs_dir: Path, host: str, port: in
             self.end_headers()
             self.wfile.write(payload)
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    try:
+        server = ThreadingHTTPServer((host, port), Handler)
+    except Exception:
+        controls.close()
+        live.close()
+        raise
     server.daemon_threads = True
-    print(f"Gridzilla dashboard: http://{host}:{port}/ (read-only)", flush=True)
+    print(f"Gridzilla dashboard: http://{host}:{port}/ ({'controls enabled' if allow_controls else 'read-only'})", flush=True)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def stop_on_sigterm(_signum: int, _frame: Any) -> None:
+        # Route SIGTERM through the same finalization path as Ctrl-C so an
+        # active benchmark restores simulator state before its forwards close.
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_on_sigterm)
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
         pass
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
         server.shutdown()
         server.server_close()
+        controls.close()
         live.close()

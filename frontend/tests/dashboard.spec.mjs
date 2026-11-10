@@ -74,10 +74,14 @@ async function mockApi(page, { live = liveState(), runs = [], saved = null } = {
   const calls = [];
   await page.route("**/api/**", async route => {
     const request = route.request();
-    calls.push({ method: request.method(), url: request.url() });
+    calls.push({ method: request.method(), url: request.url(), body: request.method() === "POST" ? request.postDataJSON() : null });
     const url = new URL(request.url());
     if (url.pathname === "/api/state") {
       await route.fulfill({ json: live });
+    } else if (url.pathname === "/api/run" && request.method() === "POST") {
+      await route.fulfill({ status: 202, json: { accepted: true, profile: request.postDataJSON().profile } });
+    } else if (url.pathname === "/api/stop" && request.method() === "POST") {
+      await route.fulfill({ status: 202, json: { accepted: true, restoration: "Gridzilla will restore simulator state" } });
     } else if (url.pathname === "/api/runs") {
       await route.fulfill({ json: runs });
     } else if (url.pathname.startsWith("/api/runs/")) {
@@ -122,6 +126,30 @@ test("live metrics with no source timestamp do not claim the sample is old", asy
   await expect(waitingMetric).toContainText("LIVE");
   await expect(waitingMetric).toContainText("sample age unavailable");
   await expect(waitingMetric).not.toContainText("old");
+});
+
+test("explicitly enabled local controls start only a listed profile", async ({ page }) => {
+  const live = liveState({controls:{enabled:true,profiles:["smoke","baseline","stepped"],running:false,
+    profile:null,stopRequested:false,lastOutcome:null,lastRunId:null}});
+  const calls = await mockApi(page, { live });
+  page.on("dialog", dialog => dialog.accept());
+  await page.goto("/");
+
+  await expect(page.getByTestId("benchmark-controls")).toContainText("Run a bounded performance profile");
+  await page.getByLabel("Profile").selectOption("baseline");
+  await page.getByTestId("start-benchmark").click();
+  await expect(page.getByRole("status")).toContainText("baseline accepted");
+  expect(calls.some(call => call.method === "POST" && call.url.endsWith("/api/run") && call.body?.profile === "baseline"))
+    .toBeTruthy();
+});
+
+test("enabled start stays disabled until all live readiness gates pass", async ({ page }) => {
+  const live = liveState({status:"STALE",gates:{simulators:"READY",eppMetrics:"LIVE",providers:"READY",overlays:"STALE",gateways:"STALE"},
+    controls:{enabled:true,profiles:["smoke","baseline","stepped"],running:false}});
+  await mockApi(page, { live });
+  await page.goto("/");
+  await expect(page.getByTestId("start-benchmark")).toBeDisabled();
+  await expect(page.getByTestId("stop-benchmark")).toBeDisabled();
 });
 
 test("stale and missing revisions are shown as stale or unavailable, not ready", async ({ page }) => {
@@ -186,6 +214,18 @@ test("saved run mode renders offline evidence and historical signal boundaries",
   const evidenceLink = page.getByRole("link", { name: "run-result.json" });
   await expect(evidenceLink).toHaveAttribute("href", "/api/runs/grid-signals-demo-20261109T120000Z/files/run-result.json");
   expect(calls.every(call => call.method === "GET")).toBeTruthy();
+});
+
+test("saved charts do not turn unavailable percentiles into zero", async ({ page }) => {
+  const run = savedRun({chartInputs:{labels:["baseline"],achievedRps:[1],p95LatencyMs:[null]}});
+  await mockApi(page, {
+    runs: [{ id: run.runId, status: "PASS", startedAtUtc: "2026-11-09T12:00:00Z" }],
+    saved: run,
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Saved runs" }).click();
+
+  await expect(page.getByTestId("saved-latency-chart")).toContainText("No eligible samples were saved.");
 });
 
 test("saved mode handles an empty evidence directory", async ({ page }) => {

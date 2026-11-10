@@ -81,7 +81,8 @@ function PoolCard({ site }) {
 }
 
 function LineChart({ title, labels = [], values = [], unit = "", testId }) {
-  const points = values.map((value, index) => ({ value: Number(value), index })).filter(point => Number.isFinite(point.value));
+  const points = values.map((value, index) => ({ value: value == null ? null : Number(value), index }))
+    .filter(point => point.value !== null && Number.isFinite(point.value));
   if (!points.length) return <section className="panel chart" data-testid={testId}><h3>{title}</h3><div className="empty">No eligible samples were saved.</div></section>;
   const width = 720, height = 220, pad = 35;
   const min = Math.min(...points.map(p => p.value));
@@ -137,6 +138,10 @@ function Gridzilla() {
   const [selectedRun, setSelectedRun] = useState("");
   const [saved, setSaved] = useState(null);
   const [error, setError] = useState("");
+  const [selectedProfile, setSelectedProfile] = useState("smoke");
+  const [controlMessage, setControlMessage] = useState("");
+  const [pendingLaunch, setPendingLaunch] = useState(null);
+  const [controlBusy, setControlBusy] = useState(false);
 
   const refreshLive = useCallback(async () => {
     const response = await fetch("/api/state", {cache:"no-store"});
@@ -174,24 +179,81 @@ function Gridzilla() {
     return () => { active = false; };
   }, [selectedRun]);
 
+  useEffect(() => {
+    if (!pendingLaunch || live?.controls?.running) return;
+    const benchmark = live?.benchmark;
+    const controls = live?.controls || {};
+    const resultId = controls.lastRunId || benchmark?.runId;
+    const outcome = controls.lastOutcome || benchmark?.status;
+    if (controls.lastOutcome === "FAIL" && !controls.lastRunId) {
+      setPendingLaunch(null);
+      setControlMessage("Benchmark failed before result evidence was saved; check the local Gridzilla process and evidence directory.");
+      return;
+    }
+    if (resultId && resultId !== pendingLaunch.previousRunId && ["PASS", "FAIL"].includes(outcome)) {
+      setSelectedRun(resultId);
+      setMode("saved");
+      setPendingLaunch(null);
+      setControlMessage(`Benchmark ${outcome.toLowerCase()}; showing its saved report.`);
+    }
+  }, [live, pendingLaunch]);
+
   const localSite = live?.localOverlay?.site;
   const liveSites = live?.sites || [];
   const localOverlay = live?.localOverlay || {};
   const crossSite = live?.crossSite || {};
   const allLive = live?.status === "LIVE" && liveSites.length === 3 && liveSites.every(site => site.status === "LIVE");
+  const controls = live?.controls || {};
+  const controlsReady = allLive && live?.gates?.simulators === "READY" && live?.gates?.eppMetrics === "LIVE" &&
+    live?.gates?.providers === "READY" && live?.gates?.overlays === "LIVE" && live?.gates?.gateways === "READY";
+  const startEnabled = controls.enabled && controlsReady && !controls.running && !controlBusy;
   const chart = saved?.chartInputs || {};
   const resourceSeries = saved?.resourceSeries || [];
+
+  const startBenchmark = async () => {
+    if (!window.confirm(`Run the bounded ${selectedProfile} profile? It sends measured Gateway traffic, applies synthetic simulator pressure, then restores and verifies the original state.`)) return;
+    setControlBusy(true);
+    setControlMessage(`Checking readiness before starting ${selectedProfile}…`);
+    try {
+      const response = await fetch("/api/run", {method:"POST", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({profile:selectedProfile})});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Run start rejected (${response.status})`);
+      setPendingLaunch({previousRunId:live?.benchmark?.runId || null});
+      setControlMessage(`${selectedProfile} accepted. Progress is shown above; the saved report opens when restoration finishes.`);
+      await refreshLive();
+    } catch (cause) {
+      setControlMessage(cause instanceof Error ? cause.message : "Benchmark start was rejected");
+    } finally {
+      setControlBusy(false);
+    }
+  };
+
+  const stopBenchmark = async () => {
+    if (!window.confirm("Stop the current benchmark? Gridzilla will restore simulator state and verify routing recovery before it finishes.")) return;
+    setControlBusy(true);
+    try {
+      const response = await fetch("/api/stop", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Stop rejected (${response.status})`);
+      setControlMessage(result.restoration || "Stop requested; Gridzilla is restoring simulator state.");
+    } catch (cause) {
+      setControlMessage(cause instanceof Error ? cause.message : "Stop request was rejected");
+    } finally {
+      setControlBusy(false);
+    }
+  };
 
   return <main className="app-shell">
     <header className="topbar"><div className="brand"><span className="brand-mark">G</span><div><strong>GRIDZILLA</strong><small>Signals-based routing performance</small></div></div>
       <nav><button className={mode === "live" ? "active" : ""} onClick={()=>setMode("live")}>Live environment</button><button className={mode === "saved" ? "active" : ""} onClick={()=>setMode("saved")}>Saved runs</button></nav>
-      <div className="header-status"><Badge value={mode === "saved" ? "HISTORICAL" : allLive ? "LIVE" : live?.status || "UNAVAILABLE"} testId="live-badge" /><span>read-only</span></div>
+      <div className="header-status"><Badge value={mode === "saved" ? "HISTORICAL" : allLive ? "LIVE" : live?.status || "UNAVAILABLE"} testId="live-badge" /><span>{mode === "live" && controls.enabled ? "local controls enabled" : "read-only"}</span></div>
     </header>
     {error && <div className="alert" role="status">{error}</div>}
     {mode === "live" ? <>
       <section className="hero panel"><div><span className="eyebrow">{live?.phase || "CONNECTING"}</span><h1>Live Grid + llm-d signal path</h1>
         <p>llm-d-sim → authenticated EPP metrics → Grid score/rank → distributed overlay → Gateway revision → attributed request.</p>
-        <small>Synthetic simulator signals are shown separately from measured Gateway traffic. This dashboard does not create load or modify the cluster.</small></div>
+        <small>Synthetic simulator signals are separate from measured Gateway traffic. {controls.enabled ? "Local controls run bounded profiles and restore simulator state." : "This view is read-only and does not create load or modify the cluster."}</small></div>
         <div className="hero-meta"><Badge value={live?.status || "UNAVAILABLE"} /><span>last sample {live?.observedAtUtc ? new Date(live.observedAtUtc).toLocaleTimeString() : "unavailable"}</span><span>source {live?.source?.revision ? `${live.source.revision.slice(0,12)}…` : "unavailable"}</span></div></section>
       <BenchmarkProgress benchmark={live?.benchmark} />
       <section className="state-strip" data-testid="readiness-states"><div><span>Simulators</span><Badge value={live?.gates?.simulators || "UNAVAILABLE"} /></div><div><span>EPP authenticated metrics</span><Badge value={live?.gates?.eppMetrics || "UNAVAILABLE"} /></div><div><span>Providers</span><Badge value={live?.gates?.providers || "UNAVAILABLE"} /></div><div><span>Overlays</span><Badge value={live?.gates?.overlays || "UNAVAILABLE"} /></div><div><span>Gateways serving</span><Badge value={live?.gates?.gateways || "UNAVAILABLE"} /></div></section>
@@ -206,7 +268,14 @@ function Gridzilla() {
       <section className="panel timeline-panel" data-testid="signal-timeline"><div className="panel-title"><div><h3>Signal-to-route timeline</h3><p>Boundary events use local monotonic durations; timestamps from different clusters may have clock skew.</p></div><Badge value={live?.transition?.status || "UNAVAILABLE"} /></div>
         <div className="timeline">{(live?.timeline || []).map((item,index)=><div className="timeline-item" key={`${item.boundary}-${index}`}><span className="timeline-dot" /><strong>{item.boundary}</strong><span>{item.observedAtUtc || "time unavailable"}</span><small>{item.durationMs == null ? "duration not measured" : `${formatNumber(item.durationMs)} ms`}</small></div>)}
           {!live?.timeline?.length && <div className="empty">No transition has been run in this attached environment.</div>}</div></section>
-      <section className="panel read-only-controls" data-testid="control-disabled"><div><h3>Controller actions are disabled</h3><p>This UI is read-only. Use the CLI's bounded `run` or explicit `restore` command to control simulator metrics.</p></div><div><button disabled>Apply simulator pressure</button><button disabled>Restore simulator</button></div></section>
+      {controls.enabled ? <section className="panel read-only-controls benchmark-controls" data-testid="benchmark-controls">
+        <div><h3>Run a bounded performance profile</h3><p>Start is enabled only while every simulator, EPP, provider, overlay, and Gateway gate is current. Pressure is synthetic and restoration is verified before completion.</p>
+          {controlMessage && <small role="status">{controlMessage}</small>}</div>
+        <div className="control-actions"><label htmlFor="benchmark-profile">Profile</label><select id="benchmark-profile" value={selectedProfile} disabled={!startEnabled}
+          onChange={event=>setSelectedProfile(event.target.value)}>{(controls.profiles || []).map(name=><option key={name} value={name}>{name}</option>)}</select>
+          <button data-testid="start-benchmark" disabled={!startEnabled} onClick={startBenchmark}>{controlBusy ? "Starting…" : "Start benchmark"}</button>
+          <button data-testid="stop-benchmark" disabled={!controls.running || controlBusy} onClick={stopBenchmark}>{controls.stopRequested ? "Stopping safely…" : "Stop safely"}</button></div>
+      </section> : <section className="panel read-only-controls" data-testid="control-disabled"><div><h3>Controller actions are disabled</h3><p>Restart the localhost dashboard with explicit <code>--allow-controls</code> to start or stop a bounded benchmark.</p></div><div><button disabled>Start benchmark</button><button disabled>Stop safely</button></div></section>}
       <section className="section-heading"><div><span className="eyebrow">RECENT RUNS</span><h2>Saved evidence</h2><p>Browse reports without contacting the clusters.</p></div><button onClick={()=>setMode("saved")}>Open run browser</button></section>
       <RunList runs={runs} onSelect={id=>{setSelectedRun(id);setMode("saved");}} />
     </> : <>
