@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.tools/
+.gridzilla-locks/
+node_modules/
+frontend/node_modules/
+web/dist/
+evidence/
+playwright-report/
+test-results/

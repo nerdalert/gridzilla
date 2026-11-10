@@ -1,0 +1,199 @@
+{
+  "schemaVersion": "gridzilla.dev/v1alpha1",
+  "runId": "grid-signals-<unique-suffix>",
+  "createdAt": "<UTC timestamp>",
+  "source": {
+    "repository": "praxis-proxy/grid",
+    "branch": "<tested branch>",
+    "commit": "<40-character Grid SHA>",
+    "worktreeStatus": "clean",
+    "sourceFingerprintSha256": "<sha256>"
+  },
+  "runtimeImages": [
+    {
+      "site": "west",
+      "component": "grid-operator",
+      "namespace": "grid-system",
+      "selector": "app=grid-operator",
+      "container": "manager",
+      "reference": "quay.io/example/grid-operator@sha256:<digest>",
+      "imageId": "containerd://sha256:<running-image-id>",
+      "sourceRevision": "<40-character source SHA>"
+    },
+    {
+      "site": "central", "component": "grid-operator", "namespace": "grid-system",
+      "selector": "app=grid-operator", "container": "manager",
+      "reference": "quay.io/example/grid-operator@sha256:<digest>",
+      "imageId": "containerd://sha256:<running-image-id>",
+      "sourceRevision": "<40-character source SHA>"
+    },
+    {
+      "site": "east", "component": "grid-operator", "namespace": "grid-system",
+      "selector": "app=grid-operator", "container": "manager",
+      "reference": "quay.io/example/grid-operator@sha256:<digest>",
+      "imageId": "containerd://sha256:<running-image-id>",
+      "sourceRevision": "<40-character source SHA>"
+    }
+  ],
+  "imageLock": "/absolute/path/from/setup/image-lock.json",
+  "client": {
+    "location": "host running the xtask",
+    "gatewayUrl": "http://<west-gateway-address>:8080/v1/chat/completions",
+    "kubeconfig": "/absolute/path/from/setup/kubeconfig",
+    "context": "<run-owned-west-context>",
+    "credentialFile": "/absolute/path/to/client-token-file",
+    "authorizationScheme": "Bearer",
+    "model": "Qwen/Qwen3-0.6B",
+    "requestPath": "/v1/chat/completions",
+    "attributionHeaders": [
+      "x-grid-combined-provider-gateway",
+      "x-ai-demo-provider-gateway",
+      "x-ai-inference-provider",
+      "x-request-id",
+      "x-inference-pod"
+    ],
+    "receipt": {
+      "available": true,
+      "type": "response_headers",
+      "requestIdHeader": "x-request-id",
+      "backendPodHeader": "x-inference-pod",
+      "backendPodPrefixBySite": {
+        "west": "vcr-inference-west-",
+        "central": "vcr-inference-central-",
+        "east": "vcr-inference-east-"
+      }
+    }
+  },
+  "backendReference": {
+    "kind": "direct simulator reference path; not an equivalent security or routing path",
+    "site": "west",
+    "namespace": "grid-system",
+    "service": "vcr-inference-west",
+    "port": 8000,
+    "model": "Qwen/Qwen3-0.6B",
+    "path": "/v1/chat/completions",
+    "requiresGatewayAuthorization": false
+  },
+  "request": {
+    "format": "OpenAI chat completions JSON",
+    "model": "Qwen/Qwen3-0.6B",
+    "body": {
+      "model": "Qwen/Qwen3-0.6B",
+      "messages": [{"role": "user", "content": "grid signals qualification"}],
+      "max_tokens": 8
+    },
+    "responseMode": "non-streaming"
+  },
+  "pressureTargetPool": "pool-a",
+  "sites": [
+    {
+      "name": "west",
+      "clusterName": "grid-signals-<run-id>-west",
+      "ownerRunId": "<same run-id>",
+      "kubeconfig": "/absolute/path/from/setup/kubeconfig",
+      "context": "<run-owned-west-context>",
+      "namespace": "grid-system",
+      "readinessTargets": [
+        {"kind": "Deployment", "name": "grid-operator", "namespace": "grid-system"},
+        {"kind": "Deployment", "name": "llmd-epp", "namespace": "grid-system"},
+        {"kind": "Deployment", "name": "provider-gateway", "namespace": "grid-system"},
+        {"kind": "Deployment", "name": "consumer-gateway", "namespace": "grid-system"},
+        {"kind": "InferenceProvider", "name": "vcr-west-provider", "namespace": "grid-system"}
+      ],
+      "provider": {
+        "resourceName": "vcr-west-provider",
+        "kind": "InferenceProvider",
+        "site": "west",
+        "pool": "pool-a",
+        "pressureTarget": true,
+        "model": "Qwen/Qwen3-0.6B",
+        "routingCluster": "vcr-west-provider",
+        "queueCapacity": 4
+      },
+      "epp": {
+        "service": "llmd-epp-metrics",
+        "namespace": "grid-system",
+        "servicePort": 9090,
+        "path": "/metrics",
+        "pool": "pool-a",
+        "pressureTarget": true,
+        "metric": "llm_d_epp_average_queue_size",
+        "auth": {
+          "type": "serviceAccountToken",
+          "tokenFile": "/absolute/path/to/west-epp-token-file",
+          "serviceAccount": "grid-operator-metrics-scraper"
+        },
+        "portForward": {"resource": "svc/llmd-epp-metrics", "localPort": 19090, "remotePort": 9090}
+      },
+      "simulator": {
+        "poolName": "pool-a",
+        "adminPort": 8000,
+        "adminPath": "/admin/config",
+        "targets": [
+          {
+            "namespace": "grid-system",
+            "podName": "<current-west-simulator-pod>",
+            "podUID": "<current-pod-uid>",
+            "configGeneration": 1,
+            "adminUrl": "http://127.0.0.1:19180/admin/config",
+            "portForward": {"resource": "pod/<current-west-simulator-pod>", "localPort": 19180, "remotePort": 8000}
+          }
+        ]
+      },
+      "overlay": {
+        "configMap": "grid-overlay-grid-combined-site-consumer-gateway",
+        "namespace": "grid-system",
+        "resourceVersion": "<observed-resource-version>",
+        "semanticRevision": "<published-overlay-revision>",
+        "candidates": ["<current-candidate-snapshot>"],
+        "mountedRevisionVerified": true
+      },
+      "gateway": {
+        "service": "consumer-gateway",
+        "namespace": "grid-system",
+        "loadBalancerAddress": "<west-gateway-address>",
+        "port": 8080,
+        "url": "http://<west-gateway-address>:8080/v1/chat/completions",
+        "responseHeaders": [
+          "x-grid-combined-provider-gateway",
+          "x-ai-demo-provider-gateway",
+          "x-ai-inference-provider",
+          "x-request-id",
+          "x-inference-pod"
+        ]
+      }
+    },
+    {
+      "name": "central", "clusterName": "grid-signals-<run-id>-central", "ownerRunId": "<same run-id>",
+      "kubeconfig": "/absolute/path/from/setup/kubeconfig", "context": "<run-owned-central-context>", "namespace": "grid-system",
+      "readinessTargets": [
+        {"kind": "Deployment", "name": "grid-operator", "namespace": "grid-system"},
+        {"kind": "Deployment", "name": "llmd-epp", "namespace": "grid-system"},
+        {"kind": "Deployment", "name": "provider-gateway", "namespace": "grid-system"},
+        {"kind": "Deployment", "name": "consumer-gateway", "namespace": "grid-system"},
+        {"kind": "InferenceProvider", "name": "vcr-central-provider", "namespace": "grid-system"}
+      ],
+      "provider": {"resourceName": "vcr-central-provider", "kind": "InferenceProvider", "site": "central", "pool": "pool-b", "pressureTarget": false, "model": "Qwen/Qwen3-0.6B", "routingCluster": "vcr-central-provider", "queueCapacity": 4},
+      "epp": {"service": "llmd-epp-metrics", "namespace": "grid-system", "servicePort": 9090, "path": "/metrics", "pool": "pool-b", "pressureTarget": false, "metric": "llm_d_epp_average_queue_size", "auth": {"type": "serviceAccountToken", "tokenFile": "/absolute/path/to/central-epp-token-file", "serviceAccount": "grid-operator-metrics-scraper"}, "portForward": {"resource": "svc/llmd-epp-metrics", "localPort": 19091, "remotePort": 9090}},
+      "simulator": {"poolName": "pool-b", "adminPort": 8000, "adminPath": "/admin/config", "targets": [{"namespace": "grid-system", "podName": "<current-central-simulator-pod>", "podUID": "<current-pod-uid>", "configGeneration": 1, "adminUrl": "http://127.0.0.1:19181/admin/config", "portForward": {"resource": "pod/<current-central-simulator-pod>", "localPort": 19181, "remotePort": 8000}}]},
+      "overlay": {"configMap": "grid-overlay-grid-combined-site-consumer-gateway", "namespace": "grid-system", "resourceVersion": "<observed-resource-version>", "semanticRevision": "<published-overlay-revision>", "candidates": ["<current-candidate-snapshot>"], "mountedRevisionVerified": true},
+      "gateway": {"service": "consumer-gateway", "namespace": "grid-system", "loadBalancerAddress": "<central-gateway-address>", "port": 8080, "url": "http://<central-gateway-address>:8080/v1/chat/completions", "responseHeaders": ["x-grid-combined-provider-gateway", "x-ai-demo-provider-gateway", "x-ai-inference-provider", "x-request-id", "x-inference-pod"]}
+    },
+    {
+      "name": "east", "clusterName": "grid-signals-<run-id>-east", "ownerRunId": "<same run-id>",
+      "kubeconfig": "/absolute/path/from/setup/kubeconfig", "context": "<run-owned-east-context>", "namespace": "grid-system",
+      "readinessTargets": [
+        {"kind": "Deployment", "name": "grid-operator", "namespace": "grid-system"},
+        {"kind": "Deployment", "name": "llmd-epp", "namespace": "grid-system"},
+        {"kind": "Deployment", "name": "provider-gateway", "namespace": "grid-system"},
+        {"kind": "Deployment", "name": "consumer-gateway", "namespace": "grid-system"},
+        {"kind": "InferenceProvider", "name": "vcr-east-provider", "namespace": "grid-system"}
+      ],
+      "provider": {"resourceName": "vcr-east-provider", "kind": "InferenceProvider", "site": "east", "pool": "pool-c", "pressureTarget": false, "model": "Qwen/Qwen3-0.6B", "routingCluster": "vcr-east-provider", "queueCapacity": 4},
+      "epp": {"service": "llmd-epp-metrics", "namespace": "grid-system", "servicePort": 9090, "path": "/metrics", "pool": "pool-c", "pressureTarget": false, "metric": "llm_d_epp_average_queue_size", "auth": {"type": "serviceAccountToken", "tokenFile": "/absolute/path/to/east-epp-token-file", "serviceAccount": "grid-operator-metrics-scraper"}, "portForward": {"resource": "svc/llmd-epp-metrics", "localPort": 19092, "remotePort": 9090}},
+      "simulator": {"poolName": "pool-c", "adminPort": 8000, "adminPath": "/admin/config", "targets": [{"namespace": "grid-system", "podName": "<current-east-simulator-pod>", "podUID": "<current-pod-uid>", "configGeneration": 1, "adminUrl": "http://127.0.0.1:19182/admin/config", "portForward": {"resource": "pod/<current-east-simulator-pod>", "localPort": 19182, "remotePort": 8000}}]},
+      "overlay": {"configMap": "grid-overlay-grid-combined-site-consumer-gateway", "namespace": "grid-system", "resourceVersion": "<observed-resource-version>", "semanticRevision": "<published-overlay-revision>", "candidates": ["<current-candidate-snapshot>"], "mountedRevisionVerified": true},
+      "gateway": {"service": "consumer-gateway", "namespace": "grid-system", "loadBalancerAddress": "<east-gateway-address>", "port": 8080, "url": "http://<east-gateway-address>:8080/v1/chat/completions", "responseHeaders": ["x-grid-combined-provider-gateway", "x-ai-demo-provider-gateway", "x-ai-inference-provider", "x-request-id", "x-inference-pod"]}
+    }
+  ]
+}

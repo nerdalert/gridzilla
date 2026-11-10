@@ -1,0 +1,18 @@
+{
+  "name": "gridzilla-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build --config frontend/vite.config.mjs",
+    "test:ui": "playwright test -c playwright.config.mjs",
+    "dev": "vite --config frontend/vite.config.mjs"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "vite": "8.2.1"
+  }
+}

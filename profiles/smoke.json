@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "smoke",
+  "maxArrivalRatePerSecond": 0.5,
+  "preallocatedVUs": 1,
+  "maxVUs": 2,
+  "maxConcurrency": 2,
+  "requestTimeout": "15s",
+  "maxOutputTokens": 32,
+  "maxResponseBytes": 65536,
+  "maxEvidenceBytes": 33554432,
+  "pressureTargetPool": "pool-a",
+  "warmup": "5s",
+  "window": "15s",
+  "repetitions": 3,
+  "rates": [0.2],
+  "pollInterval": "1s",
+  "freshnessLimit": "30s",
+  "percentileMinimumSamples": 100,
+  "slo": null
+}

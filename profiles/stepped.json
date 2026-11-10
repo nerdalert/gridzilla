@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "stepped",
+  "maxArrivalRatePerSecond": 5,
+  "preallocatedVUs": 4,
+  "maxVUs": 8,
+  "maxConcurrency": 8,
+  "requestTimeout": "30s",
+  "maxOutputTokens": 96,
+  "maxResponseBytes": 262144,
+  "maxEvidenceBytes": 268435456,
+  "pressureTargetPool": "pool-a",
+  "warmup": "20s",
+  "window": "90s",
+  "repetitions": 3,
+  "rates": [1, 2, 3, 5],
+  "pollInterval": "1s",
+  "freshnessLimit": "30s",
+  "percentileMinimumSamples": 100,
+  "slo": null
+}
