@@ -219,9 +219,10 @@ function Gridzilla() {
         body:JSON.stringify({profile:selectedProfile})});
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || `Run start rejected (${response.status})`);
-      setPendingLaunch({previousRunId:live?.benchmark?.runId || null});
-      setControlMessage(`${selectedProfile} accepted. Progress is shown above; the saved report opens when restoration finishes.`);
+      const previousRunId = live?.benchmark?.runId || null;
       await refreshLive();
+      setPendingLaunch({previousRunId});
+      setControlMessage(`${selectedProfile} accepted. Progress is shown above; the saved report opens when restoration finishes.`);
     } catch (cause) {
       setControlMessage(cause instanceof Error ? cause.message : "Benchmark start was rejected");
     } finally {
