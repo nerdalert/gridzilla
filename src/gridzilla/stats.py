@@ -46,15 +46,19 @@ def _metric_values(summary: dict[str, Any], metric: str) -> dict[str, Any]:
 
 
 def summarize_raw(raw_path: Path, summary: dict[str, Any], *, minimum_samples: int,
-                  reference: bool = False) -> dict[str, Any]:
+                  reference: bool = False, required_dimensions: tuple[str, ...] = ()) -> dict[str, Any]:
     route_counts: dict[str, int] = {}
+    route_counts_by_dimension: dict[str, dict[str, int]] = {}
     status_counts: dict[str, int] = {}
     durations: list[float] = []
     bytes_out = 0
     attribution_failures = 0
+    generic_attribution: dict[str, int] = {"complete": 0, "incomplete": 0}
+    generic_attribution_samples = 0
     output_limit_failures = 0
     timeout_errors = 0
     http_request_points = 0
+    request_body_sizes: list[int] = []
     if raw_path.is_file():
         with raw_path.open(encoding="utf-8") as stream:
             for line in stream:
@@ -80,11 +84,26 @@ def summarize_raw(raw_path: Path, summary: dict[str, Any], *, minimum_samples: i
                     bytes_out += int(float(value))
                 elif metric == "gridzilla_attribution_failures" and value is not None:
                     attribution_failures += int(float(value))
+                elif metric == "gridzilla_generic_attribution" and value is not None:
+                    quality = str(tags.get("quality", "unknown"))
+                    if quality in generic_attribution:
+                        count = int(float(value))
+                        generic_attribution[quality] += count
+                        generic_attribution_samples += count
                 elif metric == "gridzilla_output_limit_failures" and value is not None:
                     output_limit_failures += int(float(value))
                 elif metric == "gridzilla_attributed_routes" and value is not None:
                     site = str(tags.get("site", "unknown"))
                     route_counts[site] = route_counts.get(site, 0) + int(float(value))
+                elif metric == "gridzilla_gateway_requests" and value is not None:
+                    for tag, dimension_value in tags.items():
+                        if tag.startswith("dimension_"):
+                            dimension = tag.removeprefix("dimension_")
+                            counts = route_counts_by_dimension.setdefault(dimension, {})
+                            label = str(dimension_value)
+                            counts[label] = counts.get(label, 0) + int(float(value))
+                elif metric == "gridzilla_request_body_bytes" and value is not None:
+                    request_body_sizes.append(int(float(value)))
 
     metrics = summary.get("metrics", {})
     iterations_values = _metric_values(summary, "iterations")
@@ -106,6 +125,45 @@ def summarize_raw(raw_path: Path, summary: dict[str, Any], *, minimum_samples: i
         p95 = percentile(sample_values, 95, minimum_samples)
         p99 = percentile(sample_values, 99, minimum_samples)
     attributed_count = sum(route_counts.values())
+    if reference:
+        attribution_status = "not-applicable"
+        attribution_numerator = 0
+        attribution_denominator = 0
+    elif required_dimensions:
+        attribution_denominator = http_count
+        if generic_attribution_samples:
+            attribution_numerator = generic_attribution["complete"]
+            attribution_status = "complete" if attribution_numerator == attribution_denominator else "partial"
+        else:
+            # Older k6 output retained per-dimension counts but not the
+            # per-response quality metric. A single required dimension can
+            # still be counted exactly; multiple dimensions cannot be joined
+            # without per-request observations, so never invent an intersection.
+            missing_values = {"", "unknown", "unavailable", "missing", "none", "null"}
+            observed = [route_counts_by_dimension.get(dimension, {}) for dimension in required_dimensions]
+            valid_counts = [sum(count for label, count in values.items()
+                                 if label.strip().lower() not in missing_values)
+                            for values in observed]
+            if len(required_dimensions) == 1 and observed[0]:
+                attribution_numerator = valid_counts[0]
+                observed_total = sum(observed[0].values())
+                attribution_status = ("complete" if observed_total == attribution_denominator
+                                      and attribution_numerator == attribution_denominator else
+                                      "partial" if attribution_numerator > 0 else "unavailable")
+            elif any(valid_counts):
+                attribution_numerator = None
+                attribution_status = "partial"
+            else:
+                attribution_numerator = 0
+                attribution_status = "unavailable"
+    else:
+        attribution_numerator = attributed_count
+        attribution_denominator = http_count
+        attribution_status = ("not-applicable" if not route_counts else
+                              "complete" if http_count > 0 and attributed_count == http_count else "partial")
+    attribution_unattributed = (None if attribution_status in {"not-applicable", "unavailable"}
+                                or attribution_numerator is None
+                                else max(0, attribution_denominator - attribution_numerator))
     return {
         "offeredIterations": requested + dropped,
         "completedIterations": requested,
@@ -117,10 +175,21 @@ def summarize_raw(raw_path: Path, summary: dict[str, Any], *, minimum_samples: i
         "retries": 0,
         "responseBytes": bytes_out,
         "routeCountsBySite": route_counts,
-        "attributedRequests": 0 if reference else attributed_count,
-        "attributionDenominator": 0 if reference else http_count,
-        "unattributedRequests": 0 if reference else max(0, http_count - attributed_count),
-        "attributionCompleteness": (None if reference or http_count == 0 else attributed_count / http_count),
+        "routeCountsByDimension": route_counts_by_dimension or ({"site": route_counts} if route_counts else {}),
+        "requestedBodyBytes": (max(request_body_sizes) if request_body_sizes else None),
+        "verifiedBodyBytes": (min(request_body_sizes) if request_body_sizes and
+                               len(set(request_body_sizes)) == 1 else None),
+        "bodySizeSamples": len(request_body_sizes),
+        "attributionStatus": attribution_status,
+        "attributedRequests": None if attribution_status in {"not-applicable", "unavailable"}
+        or attribution_numerator is None else attribution_numerator,
+        "attributionDenominator": (None if attribution_status in {"not-applicable", "unavailable"}
+                                   else attribution_denominator),
+        "unattributedRequests": attribution_unattributed,
+        "attributionCompleteness": (None if attribution_unattributed is None or attribution_denominator == 0
+                                    else attribution_numerator / attribution_denominator),
+        "genericAttributionCounts": generic_attribution if required_dimensions else {},
+        "requiredAttributionDimensions": list(required_dimensions),
         "referencePath": reference,
         "attributionFailures": attribution_failures,
         "outputLimitFailures": output_limit_failures,

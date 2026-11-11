@@ -1,0 +1,255 @@
+kind: Dashboard
+metadata:
+  name: gridzilla-signals
+  project: gridzilla
+spec:
+  display:
+    name: Gridzilla llm-d signals
+    description: Dedicated llm-d-sim to EPP to Grid signal path. Synthetic pressure is distinct from measured inference traffic.
+  duration: 1h
+  refreshInterval: 15s
+  timezone: UTC
+  panels:
+    observation-status:
+      kind: Panel
+      spec:
+        display:
+          name: Live observation state
+          description: Missing series means no complete live snapshot was available.
+        plugin:
+          kind: StatChart
+          spec: {}
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_live_observation_status
+    epp-queue:
+      kind: Panel
+      spec:
+        display:
+          name: EPP average waiting requests per endpoint
+          description: Authenticated EPP signal used by Grid. Not the number of requests Gridzilla sent.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Average waiting requests per endpoint
+            visual:
+              display: line
+              showPoints: auto
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_epp_queue_size
+              seriesNameFormat: "{{site}} / {{pool}}"
+    synthetic-pressure:
+      kind: Panel
+      spec:
+        display:
+          name: llm-d-sim synthetic queue setting
+          description: Synthetic fake-metrics waiting-request configuration. It does not enqueue or measure real requests.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Synthetic waiting requests
+            visual:
+              display: line
+              showPoints: auto
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_simulator_synthetic_waiting_requests
+              seriesNameFormat: "{{site}} / {{pool}} synthetic"
+    queue-capacity:
+      kind: Panel
+      spec:
+        display:
+          name: Queue-depth score scale
+          description: InferenceProvider metricsConfig.queueCapacity used by Grid to normalize queue-depth scores. This is not a hard queue limit.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Scoring scale (requests)
+            visual:
+              display: line
+              showPoints: always
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_queue_capacity_scoring_scale
+              seriesNameFormat: "{{site}} / {{pool}} capacity scale"
+    ready-endpoints:
+      kind: Panel
+      spec:
+        display:
+          name: Ready EPP endpoints
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Endpoints
+            visual:
+              display: line
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_epp_ready_endpoints
+              seriesNameFormat: "{{site}} / {{pool}}"
+    sample-age:
+      kind: Panel
+      spec:
+        display:
+          name: EPP sample age
+          description: No data means the scrape had no source timestamp or the site had no current successful scrape.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Seconds
+            visual:
+              display: line
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_epp_sample_age_seconds
+              seriesNameFormat: "{{site}}"
+    candidate-score:
+      kind: Panel
+      spec:
+        display:
+          name: Grid candidate score
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Score
+            visual:
+              display: line
+              showPoints: always
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_candidate_score
+              seriesNameFormat: "{{site}} / {{pool}}"
+    candidate-rank:
+      kind: Panel
+      spec:
+        display:
+          name: Grid candidate rank
+          description: Lower rank values are preferred by the current deterministic scoring policy.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Rank (lower is preferred)
+            visual:
+              display: line
+              showPoints: always
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_candidate_rank
+              seriesNameFormat: "{{site}} / {{pool}}"
+    revision-agreement:
+      kind: Panel
+      spec:
+        display:
+          name: Overlay and Gateway revision agreement
+          description: 1 means the current overlay revision is accepted or served. Revision values are intentionally not metric labels.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Match (1=yes)
+              min: 0
+              max: 1
+            visual:
+              display: line
+              showPoints: always
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_gateway_overlay_accepted_revision_match
+              seriesNameFormat: "{{site}} accepted"
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_gateway_overlay_serving_revision_match
+              seriesNameFormat: "{{site}} serving"
+    live-resources:
+      kind: Panel
+      spec:
+        display:
+          name: Live Grid runtime resources
+          description: Values are emitted only when Gridzilla has a recent resource sample.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: CPU cores / bytes (separate scales may apply)
+            visual:
+              display: line
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_live_cluster_cpu_cores
+              seriesNameFormat: "{{site}} CPU cores"
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_live_cluster_memory_bytes
+              seriesNameFormat: "{{site}} memory bytes"
+  layouts:
+    - kind: Grid
+      spec:
+        display:
+          title: Live EPP and Grid routing
+          collapse:
+            open: true
+        items:
+          - {x: 0, y: 0, width: 4, height: 4, content: {"$ref": "#/spec/panels/observation-status"}}
+          - {x: 4, y: 0, width: 8, height: 6, content: {"$ref": "#/spec/panels/epp-queue"}}
+          - {x: 0, y: 6, width: 6, height: 6, content: {"$ref": "#/spec/panels/synthetic-pressure"}}
+          - {x: 6, y: 6, width: 6, height: 6, content: {"$ref": "#/spec/panels/queue-capacity"}}
+          - {x: 0, y: 12, width: 4, height: 6, content: {"$ref": "#/spec/panels/ready-endpoints"}}
+          - {x: 4, y: 12, width: 4, height: 6, content: {"$ref": "#/spec/panels/sample-age"}}
+          - {x: 8, y: 12, width: 4, height: 6, content: {"$ref": "#/spec/panels/candidate-score"}}
+          - {x: 0, y: 18, width: 4, height: 6, content: {"$ref": "#/spec/panels/candidate-rank"}}
+          - {x: 4, y: 18, width: 4, height: 6, content: {"$ref": "#/spec/panels/revision-agreement"}}
+          - {x: 8, y: 18, width: 4, height: 6, content: {"$ref": "#/spec/panels/live-resources"}}

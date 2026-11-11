@@ -3,10 +3,20 @@ import { check, fail } from "k6";
 import { Counter, Rate, Trend } from "k6/metrics";
 
 const target = __ENV.GZ_URL;
-const requestBody = JSON.parse(__ENV.GZ_BODY_JSON || "{}");
+const scenario = __ENV.GZ_SCENARIO || "grid";
+const requestTemplate = JSON.parse(__ENV.GZ_BODY_JSON || "{}");
+const padJsonPointer = __ENV.GZ_PAD_JSON_POINTER || "";
+const targetBodyBytes = __ENV.GZ_TARGET_BODY_BYTES ? Number(__ENV.GZ_TARGET_BODY_BYTES) : null;
+const requestBody = buildRequestBody(requestTemplate, padJsonPointer, targetBodyBytes);
+const serializedBody = JSON.stringify(requestBody);
+const serializedBodyBytes = utf8ByteLength(serializedBody);
+if (targetBodyBytes !== null && serializedBodyBytes !== targetBodyBytes) {
+  throw new Error(`serialized request template cannot produce requested ${targetBodyBytes}-byte body`);
+}
 const credentialPath = __ENV.GZ_CREDENTIAL_FILE;
 const credential = credentialPath ? open(credentialPath).trim() : "";
 const authHeader = __ENV.GZ_AUTH_HEADER || "Authorization";
+const credentialPrefix = __ENV.GZ_CREDENTIAL_PREFIX || "Bearer ";
 const requestIdHeader = __ENV.GZ_REQUEST_ID_HEADER || "X-Request-ID";
 const requestIdHeaders = JSON.parse(__ENV.GZ_REQUEST_ID_HEADERS || JSON.stringify([requestIdHeader]));
 const attribution = JSON.parse(__ENV.GZ_ATTRIBUTION_JSON || "{}");
@@ -29,14 +39,19 @@ const phase = __ENV.GZ_PHASE || "measurement";
 const clientSite = __ENV.GZ_CLIENT_SITE || "unknown";
 const ingressName = __ENV.GZ_INGRESS_NAME || "gateway";
 const referenceMode = (__ENV.GZ_REFERENCE_MODE || "false") === "true";
+const expectedStatuses = new Set(JSON.parse(__ENV.GZ_EXPECTED_STATUSES || "[]"));
+const genericDimensions = JSON.parse(__ENV.GZ_GENERIC_DIMENSIONS || "{}");
 
 const attributionFailures = new Counter("gridzilla_attribution_failures");
+const genericAttribution = new Counter("gridzilla_generic_attribution");
 const gatewayRequests = new Counter("gridzilla_gateway_requests");
 const gatewayLatency = new Trend("gridzilla_gateway_latency_ms", true);
 const gatewaySuccess = new Rate("gridzilla_gateway_success");
+const endpointSuccess = new Rate("gridzilla_endpoint_success");
 const outputLimitFailures = new Counter("gridzilla_output_limit_failures");
 const responseBytes = new Counter("gridzilla_response_bytes");
 const attributedRoutes = new Counter("gridzilla_attributed_routes");
+const requestBodyBytes = new Trend("gridzilla_request_body_bytes", true);
 
 export const options = {
   hosts: JSON.parse(__ENV.GZ_HOSTS_JSON || "{}"),
@@ -83,6 +98,32 @@ function utf8ByteLength(value) {
   return bytes;
 }
 
+function buildRequestBody(template, pointer, targetBytes) {
+  if (targetBytes === null) return template;
+  if (!Number.isSafeInteger(targetBytes) || targetBytes < 1 || targetBytes > 1048576 || !pointer) {
+    throw new Error("invalid bounded request body size or missing pad JSON pointer");
+  }
+  const parts = pointer.split("/").slice(1).map(part => part.replace(/~1/g, "/").replace(/~0/g, "~"));
+  let parent = template;
+  for (const part of parts.slice(0, -1)) {
+    const index = Array.isArray(parent) && /^\d+$/.test(part) ? Number(part) : part;
+    if (parent === null || typeof parent !== "object" || !(index in parent)) {
+      throw new Error("pad JSON pointer does not resolve to the configured request template");
+    }
+    parent = parent[index];
+  }
+  const leaf = parts[parts.length - 1];
+  const key = Array.isArray(parent) && /^\d+$/.test(leaf) ? Number(leaf) : leaf;
+  if (parent === null || typeof parent !== "object" || !(key in parent) || typeof parent[key] !== "string") {
+    throw new Error("pad JSON pointer must name an existing string field");
+  }
+  const base = JSON.stringify(template);
+  const delta = targetBytes - utf8ByteLength(base);
+  if (delta < 0) throw new Error(`requested body size ${targetBytes} is smaller than template (${utf8ByteLength(base)} bytes)`);
+  parent[key] += "x".repeat(delta);
+  return template;
+}
+
 function boundedSite(value) {
   return allowedSites.has(value) ? value : "unknown";
 }
@@ -92,8 +133,8 @@ export function gatewayTraffic() {
   const requestId = `gz-${clientSite}-${__VU}-${__ITER}-${Date.now()}`;
   const headers = { "content-type": "application/json" };
   for (const header of requestIdHeaders) headers[header] = requestId;
-  if (credential) headers[authHeader] = `Bearer ${credential}`;
-  const response = http.post(target, JSON.stringify(requestBody), {
+  if (credential) headers[authHeader] = `${credentialPrefix}${credential}`;
+  const response = http.post(target, serializedBody, {
     headers,
     timeout,
     tags: { ingress: ingressName, client_site: clientSite, phase },
@@ -112,16 +153,32 @@ export function gatewayTraffic() {
   const boundedPool = allowedPools.has(observedPool) ? observedPool : "unknown";
   const boundedBackend = allowedBackends.has(backend) ? backend : "unknown";
   const statusClass = `${Math.floor(response.status / 100)}xx`;
+  const boundedDimensions = {};
+  if (scenario === "generic") {
+    for (const [name, config] of Object.entries(genericDimensions)) {
+      const observed = responseHeader(response, config.header);
+      // A badly configured endpoint could echo an auth value in a dimension
+      // header. Keep credential contents out of metric tags even in that case.
+      boundedDimensions[name] = observed !== credential && (config.allowedValues || []).includes(observed) ? observed : "unknown";
+    }
+    if (Object.keys(genericDimensions).length > 0) {
+      const complete = Object.values(boundedDimensions).every(value => value !== "unknown");
+      genericAttribution.add(1, {phase, quality: complete ? "complete" : "incomplete"});
+    }
+  }
   const tags = {
     phase,
     ingress: ingressName,
     client_site: clientSite,
-    provider_site: boundedAttributionSite,
-    pool: boundedPool,
     status_class: statusClass,
   };
+  if (scenario === "grid") {
+    tags.provider_site = boundedAttributionSite;
+    tags.pool = boundedPool;
+  }
+  for (const [name, value] of Object.entries(boundedDimensions)) tags[`dimension_${name}`] = value;
   let attributionProblem = "";
-  if (!referenceMode) {
+  if (scenario === "grid" && !referenceMode) {
     if (!provider || !allowedProviders.has(provider)) attributionProblem = "unknown_provider";
     else if (!site || !allowedSites.has(site)) attributionProblem = "unknown_site";
     else if (!observedPool || !allowedPools.has(observedPool)) attributionProblem = "unknown_pool";
@@ -133,12 +190,17 @@ export function gatewayTraffic() {
     else if (!backendRequestId || backendRequestId !== requestId) attributionProblem = "backend_request_id_mismatch";
     else if (requiredResponseHeaders.some(name => !responseHeader(response, name))) attributionProblem = "missing_required_attribution_header";
   }
+  requestBodyBytes.add(serializedBodyBytes, {phase, body_size: bodySizeClass(serializedBodyBytes)});
   gatewayRequests.add(1, tags);
   gatewayLatency.add(response.timings.duration, tags);
-  gatewaySuccess.add(response.status >= 200 && response.status < 300, tags);
+  const success = scenario === "generic" && expectedStatuses.size
+    ? expectedStatuses.has(response.status)
+    : response.status >= 200 && response.status < 300;
+  gatewaySuccess.add(success, tags);
+  endpointSuccess.add(success, tags);
   const responseByteCount = utf8ByteLength(response.body || "");
   responseBytes.add(responseByteCount, tags);
-  if (!referenceMode && !attributionProblem) {
+  if (scenario === "grid" && !referenceMode && !attributionProblem) {
     attributedRoutes.add(1, { phase, site: boundedAttributionSite, pool: boundedPool, status_class: statusClass });
   }
 
@@ -154,14 +216,24 @@ export function gatewayTraffic() {
     console.error(`GRIDZILLA_OUTPUT_LIMIT_FAILURE ${JSON.stringify({ requestId, responseBytes: responseByteCount, limit: maxResponseBytes })}`);
   }
 
-  const success = response.status >= 200 && response.status < 300;
   check(response, {
-    "gateway returned 2xx": () => success,
+    "endpoint returned expected status": () => success,
     "response stayed within profile byte cap": () => !outputTooLarge,
     "attribution fields are valid": () => !attributionProblem,
   });
 
   if (attributionProblem || outputTooLarge) fail("Gridzilla contract failure; controller captures diagnostics and stops traffic");
+  if (!success) {
+    console.error(`GRIDZILLA_ENDPOINT_STATUS_FAILURE ${JSON.stringify({requestId, status: response.status})}`);
+    fail("endpoint returned a status outside its configured expected status set");
+  }
+}
+
+function bodySizeClass(bytes) {
+  if (bytes === 16384) return "16KiB";
+  if (bytes === 65536) return "64KiB";
+  if (bytes === 262144) return "256KiB";
+  return "other";
 }
 
 export function handleSummary(data) {

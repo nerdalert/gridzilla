@@ -3,19 +3,44 @@
 from __future__ import annotations
 
 import json
+import hmac
 import mimetypes
+import os
 import signal
+import stat
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
 
 from .controls import BenchmarkControls, ControlFailure
 from .controller import _cluster_resources, _startup_transports
+from .metrics import live_observation_is_fresh, render_metrics
 from .models import ValidationError, redacted_handoff
+from .report_model import REPORT_FORMAT, normalize_report
 from .runtime import EndpointTransport, gate_snapshot, utc_now
+
+
+def _gateway_revision_is_current(site: dict[str, Any]) -> bool:
+    overlay_revision = site.get("overlay", {}).get("revision")
+    serving_revision = site.get("gateway", {}).get("servingRevision")
+    return (isinstance(overlay_revision, str) and bool(overlay_revision)
+            and isinstance(serving_revision, str) and bool(serving_revision)
+            and overlay_revision == serving_revision)
+
+
+def _live_snapshot_max_age(refresh_seconds: float, handoff: dict[str, Any] | None) -> float:
+    """Allow one bounded collection cycle while keeping the snapshot expiry finite."""
+    refresh = max(1.0, min(float(refresh_seconds), 30.0))
+    # A full collection includes serial Kubernetes and authenticated EPP reads.
+    # Give that work a little room, but never let a snapshot outlive the handoff's
+    # configured EPP freshness window. A genuinely stalled observer still expires.
+    observer_budget = max(10.0, refresh * 4 + 4)
+    limits = [float(site["epp"]["maxSampleAgeSeconds"]) for site in (handoff or {}).get("sites", [])
+              if isinstance(site.get("epp", {}).get("maxSampleAgeSeconds"), (int, float))]
+    return min(observer_budget, min(limits)) if limits else observer_budget
 
 
 class LiveState:
@@ -23,6 +48,7 @@ class LiveState:
         self.handoff = handoff
         self.evidence_root = evidence_root.resolve()
         self.refresh_seconds = max(1.0, min(float(refresh_seconds), 30.0))
+        self.max_live_age_seconds = _live_snapshot_max_age(self.refresh_seconds, handoff)
         self.lock = threading.Lock()
         self.value: dict[str, Any] = self._empty("No live handoff was supplied")
         self.closed = threading.Event()
@@ -53,7 +79,17 @@ class LiveState:
 
     def read(self) -> dict[str, Any]:
         with self.lock:
-            return json.loads(json.dumps(self.value))
+            value = json.loads(json.dumps(self.value))
+        if value.get("status") == "LIVE" and not live_observation_is_fresh(
+                value, max_age_seconds=self.max_live_age_seconds):
+            value["status"] = "STALE" if value.get("observedAtUtc") else "UNAVAILABLE"
+            value["reason"] = "live observer has not produced a fresh complete snapshot"
+            for site in value.get("sites", []):
+                if site.get("status") == "LIVE":
+                    site["status"] = "STALE"
+                if site.get("metrics", {}).get("status") == "LIVE":
+                    site["metrics"]["status"] = "STALE"
+        return value
 
     def _poll_loop(self) -> None:
         assert self.handoff is not None and self.transport is not None
@@ -106,9 +142,13 @@ class LiveState:
         local = next((x for x in observed_sites if x["name"] == client_site), None)
         timeline = _latest_signal_timeline(self.evidence_root, self.handoff["runId"])
         all_fresh = all(item["status"] == "LIVE" for item in observed_sites)
+        # Stamp the snapshot when the complete observation is available. The
+        # gate timestamp is taken before its sequential cluster/API reads and
+        # would make a healthy, slower collection appear stale immediately.
+        observed_at = utc_now()
         return {"schemaVersion": 1, "status": "LIVE" if gate["ok"] else "STALE" if any(
                     item["status"] == "STALE" for item in observed_sites) else "UNAVAILABLE",
-                "phase": _phase_from_saved_timeline(timeline), "observedAtUtc": gate["observedAtUtc"],
+                "phase": _phase_from_saved_timeline(timeline), "observedAtUtc": observed_at,
                 "source": self.handoff["source"], "sites": observed_sites,
                 "localOverlay": {"site": client_site, "revision": (local or {}).get("overlay", {}).get("revision"),
                                  "candidates": (local or {}).get("overlay", {}).get("candidates", [])},
@@ -117,7 +157,7 @@ class LiveState:
                           "eppMetrics": "LIVE" if all(item.get("metrics", {}).get("status") == "LIVE" for item in observed_sites) else "STALE",
                           "providers": "READY" if all(item.get("provider", {}).get("available") for item in observed_sites) else "UNAVAILABLE",
                           "overlays": "LIVE" if all(item.get("overlay", {}).get("revision") for item in observed_sites) else "UNAVAILABLE",
-                          "gateways": "READY" if all(item.get("gateway", {}).get("servingRevision") == item.get("overlay", {}).get("revision")
+                          "gateways": "READY" if all(_gateway_revision_is_current(item)
                                                        for item in gate["sites"]) else "STALE"},
                 "timeline": timeline, "benchmark": _active_benchmark(self.evidence_root, self.handoff["runId"]),
                 "problems": gate.get("problems", [])}
@@ -190,13 +230,27 @@ def _saved_runs(root: Path) -> list[dict[str, Any]]:
     items = []
     for directory in sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name, reverse=True):
         result_path = directory / "run-result.json"
+        normalized_path = directory / "normalized-report.json"
         report_path = directory / "report-data.json"
         live_path = directory / "live-state.json"
-        if not result_path.exists() and not report_path.exists() and not live_path.exists():
+        if not result_path.exists() and not report_path.exists() and not normalized_path.exists() and not live_path.exists():
             continue
-        result = _read_json(report_path if report_path.exists() else result_path if result_path.exists() else live_path, {})
-        items.append({"id": directory.name, "startedAtUtc": result.get("createdAtUtc"),
-                      "status": result.get("status", "HISTORICAL")})
+        normalized = _read_json(normalized_path, {})
+        if normalized.get("formatVersion") != REPORT_FORMAT:
+            legacy = _read_json(report_path, {})
+            normalized = normalize_report(directory, report_data=legacy if legacy else None)
+        run = normalized.get("run", {})
+        topology = run.get("topology", {})
+        source = run.get("source", {})
+        setup = source.get("setup") or source.get("gridzilla") or {}
+        items.append({"id": run.get("id") or directory.name,
+                      "startedAtUtc": run.get("startedAtUtc") or run.get("createdAtUtc"),
+                      "status": run.get("status", "HISTORICAL"),
+                      "scenario": run.get("scenario", {}), "type": run.get("type"),
+                      "topology": topology, "profile": run.get("profile", {}),
+                      "sourceIdentity": setup.get("revision") or setup.get("commit"),
+                      "throughputEligible": (run.get("result") or {}).get("throughputEligibility"),
+                      "formatVersion": normalized.get("formatVersion")})
     return items
 
 
@@ -206,26 +260,18 @@ def _saved_run(root: Path, run_id: str) -> dict[str, Any] | None:
     directory = (root / run_id).resolve()
     if root.resolve() not in directory.parents:
         return None
-    report = _read_json(directory / "report-data.json", None)
-    if report is not None:
-        report["evidenceFiles"] = _safe_evidence_files(directory)
-        return report
-    result = _read_json(directory / "run-result.json", None)
-    if result is not None:
-        return {**result, "evidenceFiles": _safe_evidence_files(directory)}
-    live = _read_json(directory / "live-state.json", None)
-    if live is None:
+    normalized = _read_json(directory / "normalized-report.json", {})
+    if normalized.get("formatVersion") == REPORT_FORMAT:
+        normalized["evidenceFiles"] = _safe_evidence_files(directory)
+        return normalized
+    report = _read_json(directory / "report-data.json", {})
+    result = _read_json(directory / "run-result.json", {})
+    live = _read_json(directory / "live-state.json", {})
+    if not report and not result and not live:
         return None
-    windows = []
-    try:
-        with (directory / "windows.jsonl").open(encoding="utf-8") as stream:
-            for line in stream:
-                if line.strip():
-                    windows.append(json.loads(line))
-    except (OSError, json.JSONDecodeError):
-        windows = []
-    safe_live = _safe_live_state(live)
-    return {**safe_live, "windows": windows, "evidenceFiles": _safe_evidence_files(directory)}
+    normalized = normalize_report(directory, report_data=report if report else None)
+    normalized["evidenceFiles"] = _safe_evidence_files(directory)
+    return normalized
 
 
 def _safe_run_file(root: Path, run_id: str, filename: str) -> Path | None:
@@ -308,19 +354,32 @@ def _local_control_origin(host_header: str, origin_header: str | None, port: int
 
 def serve(*, handoff: dict[str, Any] | None, runs_dir: Path, host: str, port: int,
           refresh_seconds: float, dist: Path | None = None,
-          allow_controls: bool = False, profiles_dir: Path | None = None) -> None:
+          allow_controls: bool = False, profiles_dir: Path | None = None,
+          endpoints_dir: Path | None = None, agent_token_file: Path | None = None,
+          _shutdown_event: threading.Event | None = None,
+          _on_ready: Callable[[int], None] | None = None) -> None:
     if host != "127.0.0.1":
         raise ValueError("Gridzilla UI must bind only to 127.0.0.1")
     assets = (dist or Path(__file__).resolve().parents[2] / "web" / "dist").resolve()
     if not assets.is_dir():
         raise FileNotFoundError(f"built Gridzilla UI not found at {assets}; run npm run build")
     evidence_root = runs_dir.resolve()
+    agent_token: bytes | None = None
+    if agent_token_file is not None:
+        token_path = agent_token_file.expanduser().resolve(strict=True)
+        if not token_path.is_file():
+            raise ValueError("local agent token path must be a regular file")
+        if os.name == "posix" and stat.S_IMODE(token_path.stat().st_mode) & 0o077:
+            raise ValueError("local agent token file must not be accessible by group or other users; use chmod 600")
+        agent_token = token_path.read_bytes().strip()
+        if len(agent_token) < 32:
+            raise ValueError("local agent token file must contain at least 32 bytes")
     live = LiveState(handoff, refresh_seconds, evidence_root)
     try:
         controls = BenchmarkControls(
             enabled=allow_controls, handoff=handoff, evidence_root=evidence_root,
             profiles_dir=profiles_dir or Path(__file__).resolve().parents[2] / "profiles",
-            transport=live.transport,
+            transport=live.transport, endpoints_dir=endpoints_dir,
         )
     except Exception:
         live.close()
@@ -342,56 +401,145 @@ def serve(*, handoff: dict[str, Any] | None, runs_dir: Path, host: str, port: in
             self.end_headers()
             self.wfile.write(data)
 
+        def _error(self, code: str, message: str, status: int) -> None:
+            self._json({"status": "REJECTED", "error": {"code": code, "message": message}}, status)
+
+        def _authorized_control(self) -> bool:
+            host = self.headers.get("Host", "").lower()
+            if host not in {f"127.0.0.1:{server_port}", f"localhost:{server_port}"}:
+                return False
+            if self.client_address[0] not in {"127.0.0.1", "::1"}:
+                return False
+            origin = self.headers.get("Origin")
+            if origin is not None:
+                # A bearer token is for non-browser local agents. It must not
+                # override a hostile browser Origin and bypass same-origin
+                # protection.
+                return _local_control_origin(host, origin, server_port)
+            authorization = self.headers.get("Authorization", "")
+            if agent_token is None or not authorization.startswith("Bearer "):
+                return False
+            return hmac.compare_digest(authorization[7:].encode("utf-8"), agent_token)
+
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
             route = urlsplit(self.path).path
             if not controls.enabled:
-                self._json({"error": "Gridzilla UI is read-only; restart with --allow-controls to enable benchmark actions"}, 405)
+                self._error("CONTROLS_DISABLED", "restart with --allow-controls to enable benchmark actions", 405)
                 return
-            if not _local_control_origin(self.headers.get("Host", ""), self.headers.get("Origin"), port):
-                self._json({"error": "dashboard controls accept same-origin localhost requests only"}, 403)
+            if not self._authorized_control():
+                self._error("LOCAL_AUTH_REQUIRED", "use the same-origin UI or configured local-agent bearer token", 403)
                 return
             if self.headers.get("Transfer-Encoding"):
-                self._json({"error": "chunked control requests are not accepted"}, 411)
+                self._error("CHUNKED_NOT_ACCEPTED", "chunked control requests are not accepted", 411)
                 return
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
-                self._json({"error": "invalid Content-Length"}, 400)
+                self._error("INVALID_CONTENT_LENGTH", "invalid Content-Length", 400)
                 return
-            if content_length < 0 or content_length > 1024:
-                self._json({"error": "control request body exceeds 1 KiB"}, 413)
+            if content_length < 0 or content_length > 4096:
+                self._error("BODY_TOO_LARGE", "control request body exceeds 4 KiB", 413)
                 return
             try:
                 body = json.loads(self.rfile.read(content_length) or b"{}")
             except (json.JSONDecodeError, UnicodeDecodeError):
-                self._json({"error": "control request must be JSON"}, 400)
+                self._error("INVALID_JSON", "control request must be JSON", 400)
                 return
             if not isinstance(body, dict):
-                self._json({"error": "control request must be a JSON object"}, 400)
+                self._error("INVALID_BODY", "control request must be a JSON object", 400)
                 return
             try:
+                if route == "/api/preflight":
+                    if set(body) - {"scenario", "configurationId", "profile", "rates", "soakSeconds", "requestBodySizesBytes"}:
+                        raise ControlFailure("preflight accepts only scenario, configurationId, profile, rates, soak, and body sizes", 400)
+                    result = controls.preflight(str(body.get("scenario", "")), str(body.get("profile", "")),
+                                                body.get("configurationId"), body.get("rates"),
+                                                body.get("soakSeconds"), body.get("requestBodySizesBytes"))
+                    response = dict(result)
+                    endpoint_status = response.pop("status", None)
+                    response["status"] = "READY" if response.get("ok", True) else "BLOCKED"
+                    if isinstance(endpoint_status, int) and not isinstance(endpoint_status, bool):
+                        response["endpointStatus"] = endpoint_status
+                    self._json(response)
+                    return
                 if route == "/api/run":
-                    result = controls.start(str(body.get("profile", "")))
+                    scenario = body.get("scenario")
+                    if scenario == "generic-endpoint":
+                        if set(body) - {"scenario", "configurationId", "profile", "rates", "soakSeconds", "requestBodySizesBytes"}:
+                            raise ControlFailure("generic run accepts only a listed configuration, profile, rates, soak, and body sizes", 400)
+                        result = controls.start_generic(str(body.get("configurationId", "")),
+                                                        str(body.get("profile", "")), body.get("rates"),
+                                                        body.get("soakSeconds"), body.get("requestBodySizesBytes"))
+                    elif scenario in {None, "grid-llmd-signals"}:
+                        if set(body) - {"scenario", "profile", "rates", "soakSeconds", "requestBodySizesBytes"}:
+                            raise ControlFailure("Grid run accepts only scenario, profile, rates, soak, and body sizes", 400)
+                        result = controls.start(str(body.get("profile", "")), body.get("rates"),
+                                                body.get("soakSeconds"), body.get("requestBodySizesBytes"))
+                    else:
+                        raise ControlFailure("choose a server-listed scenario", 400)
                 elif route == "/api/stop":
-                    result = controls.stop()
+                    if set(body) != {"operationId"}:
+                        raise ControlFailure("stop requires the operationId returned by start", 400)
+                    result = controls.stop(str(body.get("operationId", "")))
                 elif route == "/api/pressure":
-                    result = controls.start_pressure(body.get("value"))
+                    if set(body) != {"value", "site"}:
+                        raise ControlFailure("pressure accepts only value and site from the Grid handoff", 400)
+                    result = controls.start_pressure(body.get("value"), body.get("site"))
                 elif route == "/api/pressure/restore":
-                    result = controls.restore_pressure()
+                    if set(body) != {"operationId"}:
+                        raise ControlFailure("restore requires the pressure operationId", 400)
+                    result = controls.restore_pressure(str(body.get("operationId", "")))
                 else:
-                    self._json({"error": "control endpoint not found"}, 404)
+                    self._error("NOT_FOUND", "control endpoint not found", 404)
                     return
             except ControlFailure as exc:
-                self._json({"error": str(exc)}, exc.status)
+                self._error("CONTROL_REJECTED", str(exc), exc.status)
+                return
+            except (ValueError, ValidationError) as exc:
+                self._error("INVALID_CONFIGURATION", str(exc), 400)
+                return
+            except OSError:
+                self._error("LOCAL_STORAGE_UNAVAILABLE", "Gridzilla could not persist operation state or evidence", 503)
                 return
             self._json(result, 202)
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
             route = urlsplit(self.path).path
+            if route == "/metrics":
+                payload = render_metrics(live.read(), handoff, evidence_root,
+                                         max_live_age_seconds=live.max_live_age_seconds).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if route == "/api/state":
                 value = live.read()
-                value["controls"] = controls.status()
+                control_state = controls.status()
+                value["controls"] = control_state
+                operation_id = control_state.get("operationId") or control_state.get("lastOperationId")
+                if operation_id:
+                    value["operationState"] = controls.operation(str(operation_id))
                 self._json(value)
+                return
+            if route == "/api/configurations":
+                state = controls.status()
+                self._json({"scenarios": state["scenarios"], "profiles": state["profileSettings"],
+                            "endpointConfigurations": controls.generic_configurations(),
+                            "gridAvailable": handoff is not None})
+                return
+            if route.startswith("/api/operations/"):
+                operation_id = unquote(route.removeprefix("/api/operations/"))
+                if "/" in operation_id or not operation_id or len(operation_id) > 64:
+                    self._error("INVALID_OPERATION_ID", "operationId is malformed", 400)
+                    return
+                value = controls.operation(operation_id)
+                if value is None:
+                    self._error("OPERATION_NOT_FOUND", "no saved operation has this ID", 404)
+                else:
+                    self._json(value)
                 return
             if route == "/api/runs":
                 self._json(_saved_runs(evidence_root))
@@ -400,7 +548,7 @@ def serve(*, handoff: dict[str, Any] | None, runs_dir: Path, host: str, port: in
                 run_id, filename = route.removeprefix("/api/runs/").split("/files/", 1)
                 target = _safe_run_file(evidence_root, unquote(run_id), unquote(filename))
                 if target is None:
-                    self._json({"error": "saved evidence file not found"}, 404)
+                    self._error("EVIDENCE_NOT_FOUND", "saved evidence file not found", 404)
                     return
                 size = target.stat().st_size
                 self.send_response(200)
@@ -415,7 +563,10 @@ def serve(*, handoff: dict[str, Any] | None, runs_dir: Path, host: str, port: in
                 return
             if route.startswith("/api/runs/"):
                 value = _saved_run(evidence_root, unquote(route.removeprefix("/api/runs/")))
-                self._json(value if value is not None else {"error": "saved run not found"}, 200 if value is not None else 404)
+                if value is None:
+                    self._error("RUN_NOT_FOUND", "saved run not found", 404)
+                else:
+                    self._json(value)
                 return
             relative = "index.html" if route == "/" else route.lstrip("/")
             target = (assets / relative).resolve()
@@ -440,22 +591,33 @@ def serve(*, handoff: dict[str, Any] | None, runs_dir: Path, host: str, port: in
         live.close()
         raise
     server.daemon_threads = True
-    print(f"Gridzilla dashboard: http://{host}:{port}/ ({'controls enabled' if allow_controls else 'read-only'})", flush=True)
-    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    server_port = int(server.server_address[1])
+    print(f"Gridzilla dashboard: http://{host}:{server_port}/ ({'controls enabled' if allow_controls else 'read-only'})", flush=True)
+    previous_sigterm = signal.getsignal(signal.SIGTERM) if _shutdown_event is None else None
 
     def stop_on_sigterm(_signum: int, _frame: Any) -> None:
         # Route SIGTERM through the same finalization path as Ctrl-C so an
         # active benchmark restores simulator state before its forwards close.
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, stop_on_sigterm)
     try:
-        server.serve_forever(poll_interval=0.25)
+        if _shutdown_event is None:
+            signal.signal(signal.SIGTERM, stop_on_sigterm)
+            if _on_ready:
+                _on_ready(server_port)
+            server.serve_forever(poll_interval=0.25)
+        else:
+            server.timeout = 0.1
+            if _on_ready:
+                _on_ready(server_port)
+            while not _shutdown_event.is_set():
+                server.handle_request()
     except KeyboardInterrupt:
         pass
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
-        server.shutdown()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+            server.shutdown()
         server.server_close()
         controls.close()
         live.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import base64
 import http.client
 import json
 import os
@@ -11,6 +12,8 @@ import signal
 import socket
 import ssl
 import subprocess
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -521,6 +524,7 @@ class EndpointTransport:
         self.handoff = handoff
         self.evidence = evidence or Path(".")
         self.forwards: list[PortForward] = []
+        self._token_lock = threading.Lock()
 
     def start_site_forwards(self, site: dict[str, Any]) -> None:
         for key in ("epp", "simulator"):
@@ -552,6 +556,69 @@ class EndpointTransport:
             return str(mapping.get("address", parsed.hostname)), int(mapping.get("port", parsed.port or (443 if parsed.scheme == "https" else 80)))
         return str(parsed.hostname), int(parsed.port or (443 if parsed.scheme == "https" else 80))
 
+    @staticmethod
+    def _jwt_expiry(token: str) -> int | None:
+        try:
+            parts = token.split(".")
+            if len(parts) != 3:
+                return None
+            payload = parts[1] + "=" * (-len(parts[1]) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            expiry = claims.get("exp")
+            return int(expiry) if isinstance(expiry, (int, float)) and not isinstance(expiry, bool) else None
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def _bearer_token(self, site: dict[str, Any], endpoint: dict[str, Any], token_file: str) -> str:
+        """Refresh an expiring handoff EPP ServiceAccount token using that site's kubeconfig."""
+        path = Path(token_file).expanduser().resolve(strict=True)
+        token = path.read_text(encoding="utf-8").strip()
+        auth = endpoint.get("auth", {})
+        if auth.get("type") != "serviceAccountToken" or not auth.get("serviceAccount"):
+            return token
+        expiry = self._jwt_expiry(token)
+        if expiry is None or expiry > time.time() + 300:
+            return token
+
+        # Separate Gridzilla transports can share a credential file (the live
+        # observer and a benchmark do). Serialize refreshes within this client
+        # and re-read after acquiring the lock in case another request rotated it.
+        with self._token_lock:
+            token = path.read_text(encoding="utf-8").strip()
+            expiry = self._jwt_expiry(token)
+            if expiry is None or expiry > time.time() + 300:
+                return token
+            cluster = site.get("_cluster", site.get("cluster", site))
+            namespace = endpoint.get("namespace", site.get("namespace"))
+            service_account = str(auth["serviceAccount"])
+            argv = ["kubectl", "--kubeconfig", str(Path(cluster["kubeconfig"]).expanduser()),
+                    "--context", str(cluster["context"]), "-n", str(namespace), "create", "token",
+                    service_account, "--duration=24h"]
+            result = run_command(argv, timeout=20)
+            if result.returncode:
+                raise RuntimeErrorChecked(
+                    f"{site.get('name', 'site')}: could not refresh the EPP ServiceAccount token "
+                    f"(kubectl exit {result.returncode})")
+            refreshed = result.stdout.decode("utf-8", errors="strict").strip()
+            refreshed_expiry = self._jwt_expiry(refreshed)
+            if refreshed_expiry is None or refreshed_expiry <= time.time() + 60:
+                raise RuntimeErrorChecked(f"{site.get('name', 'site')}: kubectl returned a non-expiring or near-expiry EPP token")
+            fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(refreshed + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_name, path)
+            except BaseException:
+                try:
+                    os.unlink(temporary_name)
+                except OSError:
+                    pass
+                raise
+            return refreshed
+
     def request(self, site: dict[str, Any], endpoint: dict[str, Any], method: str, url: str,
                 *, body: bytes | None = None, headers: dict[str, str] | None = None,
                 timeout: float = 10, token_file: str | None = None, ca_file: str | None = None) -> dict[str, Any]:
@@ -564,7 +631,7 @@ class EndpointTransport:
         request_headers = dict(headers or {})
         request_headers.setdefault("Host", f"{parsed.hostname}:{original_port}" if parsed.port else str(parsed.hostname))
         if token_file:
-            token = Path(token_file).expanduser().read_text(encoding="utf-8").strip()
+            token = self._bearer_token(site, endpoint, token_file)
             if not token or "\n" in token:
                 raise RuntimeErrorChecked(f"credential file {token_file} did not contain one token")
             request_headers["Authorization"] = f"Bearer {token}"

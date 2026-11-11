@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
-from .models import Profile, ValidationError, duration_seconds, stable_digest
-from .runner import K6Failure, execute_window, verify_k6_version
+from .models import Profile, ValidationError, duration_seconds, plan_profile, stable_digest
+from .runner import K6Failure, K6Stopped, execute_window, validate_grid_body_sizes, verify_k6_version
 from .runtime import (
     EndpointTransport, PortForward, RuntimeErrorChecked, conditions_ready, gate_snapshot,
     kubectl, metrics_snapshot, monotonic_utc_pair, normalize_image_digest,
@@ -801,7 +801,7 @@ def _candidate_for_provider(handoff: dict[str, Any], gate: dict[str, Any], site_
 
 
 def _check_signal_gate(handoff: dict[str, Any], baseline: dict[str, Any], current: dict[str, Any],
-                       pressured_site: str) -> tuple[bool, dict[str, Any]]:
+                       pressured_site: str, *, require_selection_change: bool = True) -> tuple[bool, dict[str, Any]]:
     baseline_sites = {x["name"]: x for x in baseline["sites"]}
     current_sites = {x["name"]: x for x in current["sites"]}
     report: dict[str, Any] = {"sites": {}, "ok": True}
@@ -817,11 +817,29 @@ def _check_signal_gate(handoff: dict[str, Any], baseline: dict[str, Any], curren
         rank_worsened = bool(old_candidate and new_candidate and new_candidate["rank"] > old_candidate["rank"])
         queue_changed = bool(old_q and new_q and max(new_q) > max(old_q))
         site_ok = changed_revision and new["gateway"]["servingRevision"] == new["overlay"]["revision"]
+        def source_sample_time(snapshot: dict[str, Any]) -> str | None:
+            stamps = [item.get("timestampMs") for item in snapshot.get("metrics", {}).get("queue", [])
+                      if isinstance(item, dict) and isinstance(item.get("timestampMs"), (int, float))]
+            return (dt.datetime.fromtimestamp(max(stamps) / 1000, tz=dt.timezone.utc)
+                    .isoformat().replace("+00:00", "Z") if stamps else None)
         if name == pressured_site:
             site_ok = site_ok and queue_changed and score_decreased
         report["sites"][name] = {"queueChanged": queue_changed, "scoreDecreased": score_decreased,
                                   "rankWorsened": rank_worsened, "revisionChanged": changed_revision,
+                                  "oldScore": old_candidate.get("score") if old_candidate else None,
+                                  "newScore": new_candidate.get("score") if new_candidate else None,
+                                  "oldRank": old_candidate.get("rank") if old_candidate else None,
+                                  "newRank": new_candidate.get("rank") if new_candidate else None,
                                   "oldRevision": old["overlay"]["revision"], "newRevision": new["overlay"]["revision"],
+                                  "oldAcceptedRevision": old["gateway"].get("acceptedRevision"),
+                                  "newAcceptedRevision": new["gateway"].get("acceptedRevision"),
+                                  "oldServingRevision": old["gateway"].get("servingRevision"),
+                                  "newServingRevision": new["gateway"].get("servingRevision"),
+                                  "oldEppObservedAtUtc": old.get("metrics", {}).get("observedAtUtc"),
+                                  "newEppObservedAtUtc": new.get("metrics", {}).get("observedAtUtc"),
+                                  "oldEppSampleTimestampUtc": source_sample_time(old),
+                                  "newEppSampleTimestampUtc": source_sample_time(new),
+                                  "eppFreshnessBasis": new.get("metrics", {}).get("freshnessBasis"),
                                   "oldQueue": old_q, "newQueue": new_q, "ok": site_ok}
         if not site_ok:
             report["ok"] = False
@@ -830,13 +848,15 @@ def _check_signal_gate(handoff: dict[str, Any], baseline: dict[str, Any], curren
     report["selectionChanged"] = old_top["key"] != new_top["key"]
     report["baselineTop"] = old_top
     report["pressureTop"] = new_top
-    report["ok"] = report["ok"] and report["selectionChanged"]
+    report["selectionChangeRequired"] = require_selection_change
+    report["ok"] = report["ok"] and (report["selectionChanged"] or not require_selection_change)
     return bool(report["ok"]), report
 
 
 def wait_for_signal_transition(handoff: dict[str, Any], transport: EndpointTransport, profile: Profile,
                                baseline: dict[str, Any], pressured_site: str, *, timeout_seconds: int = 180,
-                               evidence_dir: Path, stop_event: threading.Event | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+                               evidence_dir: Path, stop_event: threading.Event | None = None,
+                               require_selection_change: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
     started = monotonic_utc_pair()
     deadline = time.monotonic() + timeout_seconds
     polls = 0
@@ -850,7 +870,8 @@ def wait_for_signal_transition(handoff: dict[str, Any], transport: EndpointTrans
             last = current
             append_jsonl(evidence_dir / "readiness-timeline.jsonl", {"stage": "pressure-transition", "poll": polls, "snapshot": current})
             if current["ok"]:
-                ok, facts = _check_signal_gate(handoff, baseline, current, pressured_site)
+                ok, facts = _check_signal_gate(handoff, baseline, current, pressured_site,
+                                               require_selection_change=require_selection_change)
                 facts.update({"poll": polls, "observedAtUtc": utc_now(), "monotonicNs": time.monotonic_ns()})
                 append_jsonl(evidence_dir / "signal-boundaries.jsonl", {"boundary": "grid-overlay-and-gateway", **facts})
                 if ok:
@@ -937,53 +958,71 @@ def run_traffic_phase(handoff: dict[str, Any], profile: Profile, transport: Endp
     completed = 0
 
     def progress(action: str, *, index: str, rate: float, window_phase: str,
-                 repeat: int | None = None) -> None:
+                 repeat: int | None = None, body_size: int | None = None) -> None:
         if on_progress:
             on_progress({"action": action, "index": index, "phase": window_phase,
-                         "ratePerSecond": rate, "duration": warmup if action == "warmup-start" else duration,
-                         "repeat": repeat, "reference": reference, "completedInPhase": completed})
+                         "ratePerSecond": rate, "duration": warmup if action.startswith("warmup") else duration,
+                         "repeat": repeat, "reference": reference, "completedInPhase": completed,
+                         "requestedBodyBytes": body_size})
 
     for rate in rates:
-        if warmup:
-            sequence += 1
-            _ready_gate(handoff, transport, profile)
-            warmup_index = f"{sequence:03d}-{phase}-warmup"
-            progress("warmup-start", index=warmup_index, rate=rate, window_phase=f"{phase}-warmup")
-            warmup_result = _run_window_recording_failure(handoff, profile, transport, evidence_dir,
-                                                          phase=f"{phase}-warmup", rate=rate, duration=warmup,
-                                                          index=warmup_index, stop_event=stop_event,
-                                                          reference=reference)
-            warmup_result["type"] = "warmup"
-            append_jsonl(evidence_dir / "windows.jsonl", warmup_result)
-            completed += 1
-            progress("window-complete", index=warmup_index, rate=rate, window_phase=f"{phase}-warmup")
-        for repeat in range(1, repeats + 1):
-            sequence += 1
-            _ready_gate(handoff, transport, profile)
-            index = f"{sequence:03d}-{phase}-r{repeat}"
-            progress("measurement-start", index=index, rate=rate, window_phase=phase, repeat=repeat)
-            result = _run_window_recording_failure(handoff, profile, transport, evidence_dir,
-                                                   phase=phase, rate=rate, duration=duration,
-                                                   index=index, stop_event=stop_event,
-                                                   reference=reference)
-            result["type"] = "measurement"
-            result["repeat"] = repeat
-            result["ratePerSecond"] = rate
-            raw_path = evidence_dir / result["rawPath"] if result.get("rawPath") else Path()
-            result["accounting"] = summarize_raw(raw_path, result.get("summary", {}),
-                                                  minimum_samples=profile.percentile_minimum_samples,
-                                                  reference=bool(result.get("reference")))
-            windows.append(result)
-            append_jsonl(evidence_dir / "windows.jsonl", result)
-            completed += 1
-            progress("window-complete", index=index, rate=rate, window_phase=phase, repeat=repeat)
+        for body_size in profile.request_body_sizes_bytes:
+            size_tag = "template" if body_size is None else f"{body_size}b"
+            if warmup:
+                sequence += 1
+                _ready_gate(handoff, transport, profile)
+                warmup_index = f"{sequence:03d}-{phase}-{size_tag}-warmup"
+                progress("warmup-start", index=warmup_index, rate=rate, window_phase=f"{phase}-warmup", body_size=body_size)
+                warmup_result = _run_window_recording_failure(handoff, profile, transport, evidence_dir,
+                                                              phase=f"{phase}-warmup", rate=rate, duration=warmup,
+                                                              index=warmup_index, stop_event=stop_event,
+                                                              reference=reference,
+                                                              request_body_size_bytes=body_size,
+                                                              on_progress=(lambda update: progress(
+                                                                  str(update["action"]), index=warmup_index,
+                                                                  rate=rate, window_phase=f"{phase}-warmup"
+                                                              ) if on_progress else None))
+                warmup_result["type"] = "warmup"
+                append_jsonl(evidence_dir / "windows.jsonl", warmup_result)
+                completed += 1
+                progress("window-complete", index=warmup_index, rate=rate, window_phase=f"{phase}-warmup", body_size=body_size)
+            for repeat in range(1, repeats + 1):
+                sequence += 1
+                _ready_gate(handoff, transport, profile)
+                index = f"{sequence:03d}-{phase}-{size_tag}-r{repeat}"
+                progress("measurement-start", index=index, rate=rate, window_phase=phase, repeat=repeat, body_size=body_size)
+                result = _run_window_recording_failure(handoff, profile, transport, evidence_dir,
+                                                       phase=phase, rate=rate, duration=duration,
+                                                       index=index, stop_event=stop_event,
+                                                       reference=reference,
+                                                       request_body_size_bytes=body_size,
+                                                       on_progress=(lambda update: progress(
+                                                           str(update["action"]), index=index, rate=rate,
+                                                           window_phase=phase, repeat=repeat
+                                                       ) if on_progress else None))
+                result["type"] = "measurement"
+                result["repeat"] = repeat
+                result["ratePerSecond"] = rate
+                raw_path = evidence_dir / result["rawPath"] if result.get("rawPath") else Path()
+                result["accounting"] = summarize_raw(raw_path, result.get("summary", {}),
+                                                      minimum_samples=profile.percentile_minimum_samples,
+                                                      reference=bool(result.get("reference")))
+                result["requestedBodyBytes"] = body_size
+                result["verifiedBodyBytes"] = result["accounting"].get("verifiedBodyBytes")
+                result["bodySizeSamples"] = result["accounting"].get("bodySizeSamples", 0)
+                windows.append(result)
+                append_jsonl(evidence_dir / "windows.jsonl", result)
+                completed += 1
+                progress("window-complete", index=index, rate=rate, window_phase=phase, repeat=repeat, body_size=body_size)
     return windows
 
 
 def _run_window_recording_failure(handoff: dict[str, Any], profile: Profile, transport: EndpointTransport,
-                                 evidence_dir: Path, **kwargs: Any) -> dict[str, Any]:
+                                 evidence_dir: Path, *, on_progress: Callable[[dict[str, Any]], None] | None = None,
+                                 **kwargs: Any) -> dict[str, Any]:
     try:
-        return _run_one_window(handoff, profile, transport, evidence_dir, **kwargs)
+        return _run_one_window(handoff, profile, transport, evidence_dir,
+                               on_progress=on_progress, **kwargs)
     except Exception as exc:
         index = str(kwargs.get("index", "unknown"))
         result_path = evidence_dir / f"{index}-window-result.json"
@@ -996,27 +1035,41 @@ def _run_window_recording_failure(handoff: dict[str, Any], profile: Profile, tra
             result = {"index": index, "phase": kwargs.get("phase"), "failure": str(exc), "exitCode": None}
         result["type"] = "failed-window"
         result["failure"] = str(exc)
+        result["requestedBodyBytes"] = kwargs.get("request_body_size_bytes")
         result["accounting"] = summarize_raw(evidence_dir / f"{index}-raw.jsonl",
                                               result.get("summary") or {},
                                               minimum_samples=profile.percentile_minimum_samples,
                                               reference=bool(result.get("reference")))
+        result["verifiedBodyBytes"] = result["accounting"].get("verifiedBodyBytes")
+        result["bodySizeSamples"] = result["accounting"].get("bodySizeSamples", 0)
         append_jsonl(evidence_dir / "windows.jsonl", result)
         raise
 
 
 def _run_one_window(handoff: dict[str, Any], profile: Profile, transport: EndpointTransport,
                     evidence_dir: Path, *, phase: str, rate: float, duration: str,
-                    index: str, stop_event: threading.Event, reference: bool = False) -> dict[str, Any]:
+                    index: str, stop_event: threading.Event, reference: bool = False,
+                    request_body_size_bytes: int | None = None,
+                    on_progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
     last_poll = 0.0
     last_cluster_resource_sample = 0.0
     cluster_resource_sample_interval = 10.0
     last_probe = time.monotonic()
     probe_sequence = 0
     poll_seconds = max(1.0, float(duration_seconds(profile.poll_interval, "poll interval")))
+    last_progress = time.monotonic()
 
     def monitor() -> str | None:
-        nonlocal last_poll, last_probe, last_cluster_resource_sample, probe_sequence
+        nonlocal last_poll, last_probe, last_cluster_resource_sample, probe_sequence, last_progress
         now = time.monotonic()
+        if on_progress and now - last_progress >= 5.0:
+            last_progress = now
+            try:
+                on_progress({"action": "measurement-running"})
+            except OSError:
+                # The live heartbeat is observability-only; it must not change
+                # benchmark traffic or replace the window's primary evidence.
+                pass
         if now - last_poll < poll_seconds:
             return None
         last_poll = now
@@ -1070,7 +1123,8 @@ def _run_one_window(handoff: dict[str, Any], profile: Profile, transport: Endpoi
 
     result = execute_window(handoff, profile, evidence_dir=evidence_dir, phase=phase,
                             rate=rate, duration=duration, index=index, reference=reference,
-                            monitor=monitor, stop_event=stop_event)
+                            monitor=monitor, stop_event=stop_event,
+                            request_body_size_bytes=request_body_size_bytes)
     return result
 
 
@@ -1087,7 +1141,10 @@ def _directory_size(path: Path) -> int:
 
 def run_benchmark(handoff: dict[str, Any], profile: Profile, profile_path: Path, *, root: Path | None = None,
                   stop_event: threading.Event | None = None,
-                  transport: EndpointTransport | None = None) -> dict[str, Any]:
+                  transport: EndpointTransport | None = None,
+                  operation_id: str | None = None,
+                  on_progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+    validate_grid_body_sizes(handoff, profile)
     handoff = _token_resolved_handoff(handoff)
     stop_event = stop_event or threading.Event()
     if profile.slo and not isinstance(profile.slo, dict):
@@ -1110,11 +1167,13 @@ def run_benchmark(handoff: dict[str, Any], profile: Profile, profile_path: Path,
     write_json(directory / "host-start.json", _host_resource_sample())
     status_path = directory / "live-state.json"
     state = {"runId": directory.name, "setupRunId": handoff["runId"], "phase": "preflight", "status": "RUNNING",
+             "operationId": operation_id, "scenario": "grid-llmd-signals",
              "createdAtUtc": utc_now(), "updatedAtUtc": utc_now()}
     write_json(status_path, state)
     completed_traffic_windows = 0
-    phase_count = len(profile.rates) + (1 if handoff.get("backendReference", {}).get("url") else 0) + 2
-    expected_traffic_windows = phase_count * (profile.repetitions + (1 if duration_seconds(profile.warmup, "profile.warmup") else 0))
+    traffic_plan = plan_profile(profile, scenario="grid",
+                                has_reference=bool(handoff.get("backendReference", {}).get("url")))
+    expected_traffic_windows = traffic_plan["windowCount"]
 
     def record_traffic_progress(update: dict[str, Any]) -> None:
         nonlocal completed_traffic_windows
@@ -1124,6 +1183,9 @@ def run_benchmark(handoff: dict[str, Any], profile: Profile, profile_path: Path,
                                            "expectedWindows": expected_traffic_windows},
                       "updatedAtUtc": utc_now()})
         write_json(status_path, state)
+        if on_progress:
+            on_progress({"runId": directory.name, "scenario": "grid-llmd-signals",
+                         **state["trafficProgress"]})
 
     owns_transport = transport is None
     try:
@@ -1149,6 +1211,7 @@ def run_benchmark(handoff: dict[str, Any], profile: Profile, profile_path: Path,
     windows: list[dict[str, Any]] = []
     signal_events = []
     failure: str | None = None
+    stopped = False
     with SignalRestorer():
         try:
             preflight = doctor(handoff, profile=profile, evidence=directory, transport=transport)
@@ -1249,6 +1312,11 @@ def run_benchmark(handoff: dict[str, Any], profile: Profile, profile_path: Path,
                                              stop_event=stop_event, on_progress=record_traffic_progress))
             if profile.slo:
                 _evaluate_slo(windows, profile.slo)
+        except (StopRequested, K6Stopped):
+            stopped = True
+            state.update({"status": "RUNNING", "phase": "stopping", "stopRequested": True,
+                          "updatedAtUtc": utc_now()})
+            write_json(status_path, state)
         except BaseException as exc:
             failure = str(exc)
             state.update({"status": "FAIL", "failure": failure, "updatedAtUtc": utc_now()})
@@ -1286,11 +1354,14 @@ def run_benchmark(handoff: dict[str, Any], profile: Profile, profile_path: Path,
                 failure = "simulator restoration was not verified"
             write_json(directory / "end-state.json", final_gate)
             write_json(directory / "host-end.json", _host_resource_sample())
-            state.update({"phase": "complete" if not failure else "failed", "status": "PASS" if not failure and restoration.get("verified") else "FAIL", "updatedAtUtc": utc_now()})
+            final_status = "FAIL" if failure or not restoration.get("verified") or not final_gate.get("ok") else "STOPPED" if stopped else "PASS"
+            state.update({"phase": "stopped" if final_status == "STOPPED" else "complete" if final_status == "PASS" else "failed",
+                          "status": final_status, "stopRequested": stopped, "updatedAtUtc": utc_now()})
             write_json(status_path, state)
             write_json(directory / "run-result.json", {
                 "schemaVersion": 1, "type": "benchmark", "runId": directory.name,
                 "setupRunId": handoff["runId"], "status": state["status"], "failure": failure,
+                "stopRequested": stopped,
                 "createdAtUtc": state.get("createdAtUtc", utc_now()), "finishedAtUtc": utc_now(),
                 "windows": windows, "signalEvents": signal_events,
                 "restoration": restoration, "endState": final_gate,

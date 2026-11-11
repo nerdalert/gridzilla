@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gridzilla"
 version = "0.1.0"
-description = "Bounded llm-d/EPP signal-routing benchmark and evidence UI"
+description = "Bounded generic HTTP and Grid signals benchmark with local evidence UI"
 requires-python = ">=3.11"
 dependencies = []
 

@@ -10,6 +10,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from gridzilla.runner import arrival_parameters, verify_k6_version
+from gridzilla.endpoints import load_endpoint
+from gridzilla.models import load_profile
+from gridzilla.runner import build_generic_k6_command
 
 
 class MockGateway(BaseHTTPRequestHandler):
@@ -35,10 +38,37 @@ class MockGateway(BaseHTTPRequestHandler):
         return
 
 
+class MockGenericEndpoint(BaseHTTPRequestHandler):
+    received: list[tuple[int, dict]] = []
+    lock = threading.Lock()
+
+    def do_POST(self):  # noqa: N802 - HTTP server API
+        length = int(self.headers.get("content-length", "0"))
+        raw = self.rfile.read(length)
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            self.send_error(400)
+            return
+        with type(self).lock:
+            type(self).received.append((len(raw), body))
+        payload = b'{"ok":true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("X-Region", "mock-east")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, _format, *_args):
+        return
+
+
 class K6MockSmokeTests(unittest.TestCase):
     def test_fractional_arrival_rate_uses_integer_k6_rate_and_time_unit(self):
         self.assertEqual(arrival_parameters(0.2), (1, "5s"))
         self.assertEqual(arrival_parameters(1.5), (3, "2s"))
+        self.assertEqual(arrival_parameters(100), (100, "1s"))
 
     def test_pinned_k6_gridzilla_script_against_local_mock_gateway(self):
         if not os.environ.get("K6_BIN"):
@@ -111,6 +141,65 @@ class K6MockSmokeTests(unittest.TestCase):
                 points = [json.loads(line) for line in raw.read_text().splitlines() if line]
                 self.assertTrue(any(point.get("metric") == "gridzilla_attributed_routes" for point in points))
                 self.assertFalse(any("GRIDZILLA_ATTRIBUTION_FAILURE" in line for line in result.stderr.splitlines()))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_pinned_k6_sends_exact_generic_json_body_sizes(self):
+        if not os.environ.get("K6_BIN"):
+            self.skipTest("set K6_BIN to the checksum-verified pinned k6 binary to run this mock smoke")
+        try:
+            binary, actual = verify_k6_version("v1.8.2")
+        except Exception as exc:
+            self.skipTest(f"pinned k6 binary is unavailable: {exc}")
+        self.assertEqual(actual, "v1.8.2")
+        repo = Path(__file__).resolve().parents[1]
+        MockGenericEndpoint.received = []
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MockGenericEndpoint)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config_path = root / "endpoint.json"
+                config_path.write_text(json.dumps({
+                    "id": "mock-generic", "name": "Local JSON endpoint",
+                    "url": f"http://127.0.0.1:{server.server_port}/complete",
+                    "requestTemplate": {"model": "model-preserved", "messages": [
+                        {"role": "user", "content": "small prompt"}], "temperature": 0},
+                    "padJsonPointer": "/messages/0/content", "expectedStatuses": [200],
+                    "responseHeaderDimensions": {"region": {"header": "X-Region", "allowedValues": ["mock-east"]}},
+                }), encoding="utf-8")
+                endpoint = load_endpoint(config_path)
+                profile = load_profile(repo / "profiles" / "body-sizes.json")
+                for size in (16 * 1024, 64 * 1024, 256 * 1024):
+                    summary = root / f"summary-{size}.json"
+                    argv, env, expected_bytes = build_generic_k6_command(
+                        endpoint, profile, evidence_dir=root, phase="mock-generic", rate=1,
+                        duration="1s", index=str(size), request_body_size_bytes=size)
+                    self.assertEqual(expected_bytes, size)
+                    env["GZ_SUMMARY_PATH"] = str(summary)
+                    env["GZ_URL"] = endpoint.url
+                    result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30, check=False)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertTrue(summary.is_file(), result.stdout + result.stderr)
+                    raw = root / f"{size}-raw.jsonl"
+                    points = [json.loads(line) for line in raw.read_text().splitlines() if line]
+                    point_sizes = [point.get("data", {}).get("value") for point in points
+                                   if point.get("type") == "Point"
+                                   and point.get("metric") == "gridzilla_request_body_bytes"]
+                    point_sizes = [value for value in point_sizes if value is not None]
+                    self.assertTrue(point_sizes, f"k6 must record serialized request-body bytes; points={points!r}")
+                    self.assertEqual(set(point_sizes), {size})
+                self.assertEqual({size for size, _body in MockGenericEndpoint.received},
+                                 {16 * 1024, 64 * 1024, 256 * 1024})
+                for size, body in MockGenericEndpoint.received:
+                    self.assertEqual(body["model"], "model-preserved")
+                    self.assertEqual(body["temperature"], 0)
+                    self.assertEqual(body["messages"][0]["role"], "user")
+                    self.assertTrue(body["messages"][0]["content"].startswith("small prompt"))
+                    self.assertEqual(size, len(json.dumps(body, separators=(",", ":")).encode("utf-8")))
         finally:
             server.shutdown()
             server.server_close()

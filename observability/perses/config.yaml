@@ -1,0 +1,12 @@
+database:
+  file:
+    folder: /perses
+    extension: yaml
+
+provisioning:
+  folders:
+    - /etc/perses/provisioning
+  interval: 1m
+
+security:
+  enable_auth: false

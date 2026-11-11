@@ -1,0 +1,221 @@
+kind: Dashboard
+metadata:
+  name: gridzilla-benchmark
+  project: gridzilla
+spec:
+  display:
+    name: Gridzilla benchmark windows
+    description: Latest completed windows from a fresh active benchmark only. Saved historical reports are not exported as live Prometheus samples.
+  duration: 1h
+  refreshInterval: 15s
+  timezone: UTC
+  panels:
+    throughput:
+      kind: Panel
+      spec:
+        display:
+          name: Offered and achieved requests per second
+          description: Offered is the configured k6 constant arrival rate; achieved is completed HTTP requests divided by measured window duration.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Requests / second
+            visual:
+              display: line
+              showPoints: always
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_benchmark_offered_requests_per_second
+              seriesNameFormat: "{{scenario}} / {{phase}} / {{traffic_path}} / {{body_size}} offered"
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_benchmark_achieved_requests_per_second
+              seriesNameFormat: "{{scenario}} / {{phase}} / {{traffic_path}} / {{body_size}} achieved"
+    request-body-size:
+      kind: Panel
+      spec:
+        display:
+          name: Serialized request body bytes
+          description: Fixed body-size classes for the latest completed active-run window; request contents and arbitrary labels are not exported.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: UTF-8 bytes
+            visual:
+              display: line
+              showPoints: always
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_benchmark_request_body_bytes
+              seriesNameFormat: "{{scenario}} / {{phase}} / {{traffic_path}} / {{body_size}}"
+    latency:
+      kind: Panel
+      spec:
+        display:
+          name: Response latency percentiles
+          description: Percentile series appear only when the active profile's minimum sample count is reached. No data is not zero latency.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Milliseconds
+            visual:
+              display: line
+              showPoints: always
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_benchmark_latency_milliseconds
+              seriesNameFormat: "{{scenario}} / {{phase}} / {{traffic_path}} / {{body_size}} {{quantile}}"
+    failures:
+      kind: Panel
+      spec:
+        display:
+          name: HTTP errors and dropped iterations
+          description: Error responses and k6 dropped iterations are separate counters for the latest completed window.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Requests / iterations
+            visual:
+              display: line
+              showPoints: always
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_benchmark_http_errors
+              seriesNameFormat: "{{scenario}} / {{phase}} / {{traffic_path}} / {{body_size}} HTTP errors"
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_benchmark_dropped_iterations
+              seriesNameFormat: "{{scenario}} / {{phase}} / {{traffic_path}} / {{body_size}} dropped iterations"
+    sample-count:
+      kind: Panel
+      spec:
+        display:
+          name: Latency sample count and percentile gate
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Samples
+            visual:
+              display: line
+              showPoints: always
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_benchmark_latency_sample_count
+              seriesNameFormat: "{{scenario}} / {{phase}} / {{traffic_path}} / {{body_size}} latency samples"
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_benchmark_percentile_minimum_samples
+              seriesNameFormat: "{{scenario}} / {{phase}} / {{traffic_path}} / {{body_size}} minimum for percentiles"
+    route-attribution:
+      kind: Panel
+      spec:
+        display:
+          name: Attributed Gateway requests by routing dimension
+          description: Observed counts across bounded site or pool values. Missing values are unavailable, never inferred as zero.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Attributed requests
+            visual:
+              display: bar
+              showPoints: always
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_benchmark_route_attributed_requests_by_dimension
+              seriesNameFormat: "{{scenario}} / {{phase}} / {{traffic_path}} / {{body_size}} / {{dimension}}={{value}}"
+    resources:
+      kind: Panel
+      spec:
+        display:
+          name: Benchmark host and cluster resources
+          description: Local load-generator and Grid runtime resource samples; unavailable measurements are omitted.
+        plugin:
+          kind: TimeSeriesChart
+          spec:
+            yAxis:
+              label: Resource values (unit is in each series name)
+            visual:
+              display: line
+        queries:
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_host_available_memory_bytes
+              seriesNameFormat: "host available memory (bytes)"
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_cluster_cpu_cores
+              seriesNameFormat: "{{site}} runtime CPU cores"
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_cluster_memory_bytes
+              seriesNameFormat: "{{site}} runtime memory bytes"
+          - kind: TimeSeriesQuery
+            spec:
+              plugin:
+                kind: PrometheusTimeSeriesQuery
+                spec:
+                  query: gridzilla_host_cpu_saturated
+              seriesNameFormat: "host saturated (1=yes)"
+  layouts:
+    - kind: Grid
+      spec:
+        display:
+          title: Active benchmark windows
+          collapse:
+            open: true
+        items:
+          - {x: 0, y: 0, width: 12, height: 7, content: {"$ref": "#/spec/panels/throughput"}}
+          - {x: 0, y: 7, width: 6, height: 7, content: {"$ref": "#/spec/panels/request-body-size"}}
+          - {x: 6, y: 7, width: 6, height: 7, content: {"$ref": "#/spec/panels/latency"}}
+          - {x: 0, y: 14, width: 6, height: 7, content: {"$ref": "#/spec/panels/failures"}}
+          - {x: 6, y: 14, width: 6, height: 7, content: {"$ref": "#/spec/panels/sample-count"}}
+          - {x: 0, y: 21, width: 6, height: 6, content: {"$ref": "#/spec/panels/route-attribution"}}
+          - {x: 6, y: 21, width: 6, height: 7, content: {"$ref": "#/spec/panels/resources"}}

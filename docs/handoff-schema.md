@@ -31,6 +31,10 @@ and run-owned prefix before attaching.
 Each site must have `ownerRunId == runId`; cluster names must carry the run-owned prefix. Each provider's queue capacity must be positive and sourced from active
 Grid policy. Exactly one provider must set `pressureTarget: true`, and its pool must equal the profile's explicit `pressureTargetPool`. The setup currently
 requires the marked provider to be west/Pool A and rank 0 on the west Gateway before pressure; Gridzilla fails closed if the actual current selection differs.
+This marked target is used by the complete CLI/UI benchmark. The dashboard's
+separate manual pressure buttons are derived per region from each site's
+simulator targets and queue-capacity scale; they do not change the benchmark's
+configured pressure target.
 Setup-provided `localPort` values are hints: the environment may remain idle while other host processes claim those ports. Gridzilla asks kubectl to bind an
 ephemeral loopback port and records the assigned value in the attached redacted handoff and per-forward logs.
 

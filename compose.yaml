@@ -1,0 +1,35 @@
+name: gridzilla-observability
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
+    # Linux host networking is used only so Prometheus can scrape Gridzilla's
+    # loopback-only HTTP endpoint; its own listener is explicitly loopback.
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+      - --web.listen-address=127.0.0.1:9090
+    network_mode: host
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/targets:/etc/prometheus/targets:ro
+      - gridzilla-prometheus-data:/prometheus
+    restart: unless-stopped
+
+  perses:
+    image: persesdev/perses:v0.55.1@sha256:292605f009770f07aa17217e70f877fabbc74858d0af9054d395064e1c411c06
+    command: ["--config=/etc/perses/config.yaml", "--web.listen-address=127.0.0.1:8080"]
+    # Host networking lets Perses reach the loopback-only Prometheus listener.
+    # Its explicit listen address keeps the UI loopback-only as well.
+    network_mode: host
+    volumes:
+      - ./observability/perses/config.yaml:/etc/perses/config.yaml:ro
+      - ./observability/perses/provisioning:/etc/perses/provisioning:ro
+      - gridzilla-perses-data:/perses
+    restart: unless-stopped
+
+volumes:
+  gridzilla-prometheus-data:
+  gridzilla-perses-data:

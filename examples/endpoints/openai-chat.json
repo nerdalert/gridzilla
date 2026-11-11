@@ -1,0 +1,21 @@
+{
+  "id": "example-openai-chat",
+  "name": "Example OpenAI-compatible chat endpoint",
+  "url": "http://127.0.0.1:8081/v1/chat/completions",
+  "requestTemplate": {
+    "model": "example-model",
+    "messages": [
+      {"role": "user", "content": "Reply briefly with OK."}
+    ],
+    "max_tokens": 32,
+    "stream": false
+  },
+  "padJsonPointer": "/messages/0/content",
+  "credentialFile": null,
+  "credentialHeader": "Authorization",
+  "credentialPrefix": "Bearer ",
+  "caFile": null,
+  "expectedStatuses": [200],
+  "responseHeaderDimensions": {},
+  "requestIdHeader": "X-Request-ID"
+}

@@ -13,6 +13,7 @@ HANDOFF_VERSION = "gridzilla.dev/v1alpha1"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RUN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,62}$")
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
 
 
 class ValidationError(ValueError):
@@ -518,6 +519,7 @@ class Profile:
     window: str
     repetitions: int
     rates: tuple[float, ...]
+    request_body_sizes_bytes: tuple[int | None, ...]
     poll_interval: str
     freshness_limit: str
     percentile_minimum_samples: int
@@ -540,6 +542,57 @@ def duration_seconds(value: Any, where: str, *, maximum: int = 3600) -> int:
     return amount
 
 
+def plan_profile(profile: Profile, *, scenario: str = "grid", has_reference: bool | None = None,
+                 rates: tuple[float, ...] | None = None, window: str | None = None,
+                 request_body_sizes_bytes: tuple[int | None, ...] | None = None) -> dict[str, Any]:
+    """Return the shared bounded traffic plan used by validation, controls and progress."""
+    if scenario not in {"grid", "generic"}:
+        raise ValidationError("scenario must be 'grid' or 'generic'")
+    selected_rates = rates or profile.rates
+    selected_window = window or profile.window
+    selected_sizes = request_body_sizes_bytes or profile.request_body_sizes_bytes
+    window_seconds = duration_seconds(selected_window, "profile.window", maximum=600)
+    warmup_seconds = duration_seconds(profile.warmup, "profile.warmup", maximum=300)
+    if has_reference is None:
+        has_reference = scenario == "grid"
+    if scenario == "grid":
+        rate_sets = [(selected_rates, "baseline"),
+                     ( (profile.direct_reference_rate,), "direct-reference") if has_reference else ((), "direct-reference"),
+                     ((profile.signal_rate,), "pressure"), ((profile.signal_rate,), "recovery")]
+    else:
+        rate_sets = [(selected_rates, "baseline"),
+                     ((profile.direct_reference_rate,), "direct-reference") if has_reference else ((), "direct-reference")]
+    traffic_window_specs = [(phase, rate, size) for rate_values, phase in rate_sets
+                            for rate in rate_values for size in selected_sizes]
+    measurement_window_count = len(traffic_window_specs) * profile.repetitions
+    warmup_window_count = len(traffic_window_specs) * (1 if warmup_seconds else 0)
+    window_count = measurement_window_count + warmup_window_count
+    total_seconds = measurement_window_count * window_seconds + warmup_window_count * warmup_seconds
+    offered = sum(rate for _phase, rate, _size in traffic_window_specs) * (
+        profile.repetitions * window_seconds + warmup_seconds
+    )
+    estimated_evidence = int(offered * 12_000 + window_count * 2_000_000)
+    max_body_bytes = max((size or 0 for size in selected_sizes), default=0)
+    # A VU can retain the serialized string plus JS/K6 copies while the HTTP
+    # request is active. Four copies is a conservative planning estimate; it
+    # is not an allocation guarantee or a substitute for host monitoring.
+    estimated_body_memory = max_body_bytes * profile.max_vus * 4
+    if total_seconds > 7200:
+        raise ValidationError("total run duration exceeds Gridzilla's 2-hour safety limit")
+    if offered > 25_000:
+        raise ValidationError("profile exceeds Gridzilla's 25,000-request safety limit")
+    if estimated_evidence > profile.max_evidence_bytes:
+        raise ValidationError(f"profile may produce ~{estimated_evidence} bytes of raw evidence, above maxEvidenceBytes")
+    if estimated_body_memory > 128 * 1024 * 1024:
+        raise ValidationError("estimated request body copies multiplied by maxVUs exceed the 128 MiB memory safety estimate")
+    return {"scenario": scenario, "windowCount": window_count, "measurementWindowCount": measurement_window_count,
+            "warmupWindowCount": warmup_window_count,
+            "durationSeconds": total_seconds, "offeredRequests": int(offered),
+            "estimatedEvidenceBytes": estimated_evidence, "estimatedRequestMemoryBytes": estimated_body_memory,
+            "requestBodySizesBytes": list(selected_sizes), "rates": list(selected_rates),
+            "windowSeconds": window_seconds, "warmupSeconds": warmup_seconds}
+
+
 def load_profile(path: Path) -> Profile:
     raw = load_json(path)
     if raw.get("version") != 1:
@@ -549,8 +602,8 @@ def load_profile(path: Path) -> Profile:
     preallocated = int(_required(raw, "preallocatedVUs", "profile"))
     max_vus = int(_required(raw, "maxVUs", "profile"))
     concurrency = int(_required(raw, "maxConcurrency", "profile"))
-    if not (0 < max_rate <= 50):
-        raise ValidationError("maxArrivalRatePerSecond must be in (0, 50]")
+    if not (0 < max_rate <= 100):
+        raise ValidationError("maxArrivalRatePerSecond must be in (0, 100]")
     if not (1 <= preallocated <= max_vus <= concurrency <= 100):
         raise ValidationError("VUs must satisfy 1 <= preallocatedVUs <= maxVUs <= maxConcurrency <= 100")
     timeout = str(_required(raw, "requestTimeout", "profile"))
@@ -575,6 +628,13 @@ def load_profile(path: Path) -> Profile:
     rates = tuple(float(rate) for rate in rates_raw)
     if any(rate <= 0 or rate > max_rate for rate in rates):
         raise ValidationError("every rate must be positive and <= maxArrivalRatePerSecond")
+    sizes_raw = raw.get("requestBodySizesBytes", [None])
+    if (not isinstance(sizes_raw, list) or not sizes_raw or len(sizes_raw) > 6
+            or any(size is not None and (isinstance(size, bool) or not isinstance(size, int)
+                                         or not 1 <= size <= MAX_REQUEST_BODY_BYTES)
+                   for size in sizes_raw)):
+        raise ValidationError("requestBodySizesBytes must be up to 6 body sizes between 1 byte and 1 MiB")
+    sizes = tuple(sizes_raw)
     poll = str(_required(raw, "pollInterval", "profile"))
     freshness = str(_required(raw, "freshnessLimit", "profile"))
     duration_seconds(poll, "profile.pollInterval", maximum=60)
@@ -589,25 +649,14 @@ def load_profile(path: Path) -> Profile:
         raise ValidationError("pressureTargetPool must identify the Pool A signal target")
     if not (0 < signal_rate <= max_rate and 0 < reference_rate <= max_rate):
         raise ValidationError("signalRate and directReferenceRate must be positive and within max rate")
-    warmup_s = duration_seconds(warmup, "profile.warmup", maximum=300)
-    window_s = duration_seconds(window, "profile.window", maximum=600)
-    # Bound the total planned wall time and open-loop volume across baseline,
-    # direct reference, pressure, recovery, and warmup phases.
-    # Overestimate by including the optional direct-reference phase so the
-    # profile's duration and evidence bounds remain safe without a handoff.
-    phase_count = len(rates) + 3
-    windows_per_phase = repetitions + (1 if warmup_s > 0 else 0)
-    number_windows = windows_per_phase * phase_count
-    total_seconds = number_windows * (warmup_s + window_s)
-    total_iterations = windows_per_phase * (sum(rates) + reference_rate + 2 * signal_rate) * (warmup_s + window_s)
-    estimated_evidence = int(total_iterations * 12_000 + number_windows * 2_000_000)
-    if total_seconds > 7200 or total_iterations > 25_000:
-        raise ValidationError("profile exceeds Gridzilla's total run duration or offered-iteration safety cap")
-    if estimated_evidence > evidence_bytes:
-        raise ValidationError(f"profile may produce ~{estimated_evidence} bytes of raw evidence, above maxEvidenceBytes")
-    return Profile(name, max_rate, preallocated, max_vus, concurrency, timeout, output_tokens,
-                   response_bytes, evidence_bytes, warmup, window, repetitions, rates, poll, freshness,
+    profile = Profile(name, max_rate, preallocated, max_vus, concurrency, timeout, output_tokens,
+                   response_bytes, evidence_bytes, warmup, window, repetitions, rates, sizes, poll, freshness,
                    min_samples, signal_rate, reference_rate, pressure_target_pool, raw.get("slo"), raw)
+    # Parsing a shared profile must not require a Grid handoff or include
+    # Grid-only pressure/reference phases. The selected scenario's preflight
+    # applies the same planner with its actual phase set before traffic.
+    plan_profile(profile, scenario="generic", has_reference=False)
+    return profile
 
 
 def redacted_handoff(raw: dict[str, Any]) -> dict[str, Any]:

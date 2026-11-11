@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from gridzilla import controller
-from gridzilla.models import ValidationError, load_profile, redacted_handoff, validate_handoff
+from gridzilla.models import ValidationError, load_profile, plan_profile, redacted_handoff, validate_handoff
 from gridzilla.report import regenerate_report
 from gridzilla.runtime import (PortForward, RuntimeErrorChecked, gateway_revisions, port_forward_log_confirms,
                                port_forward_log_port, provider_snapshot, runtime_image_snapshot,
@@ -373,12 +374,65 @@ class ResultsTests(unittest.TestCase):
             self.assertEqual(result["attributionFailures"], 1)
             self.assertEqual(result["statusCounts"], {"200": 1, "502": 1})
 
+    def test_generic_attribution_counts_every_response_and_marks_missing_dimensions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw.jsonl"
+            rows = [
+                {"type": "Point", "metric": "http_reqs", "data": {"value": 1, "tags": {"status": "200"}}},
+                {"type": "Point", "metric": "http_reqs", "data": {"value": 1, "tags": {"status": "503"}}},
+                {"type": "Point", "metric": "gridzilla_generic_attribution",
+                 "data": {"value": 1, "tags": {"quality": "complete"}}},
+                {"type": "Point", "metric": "gridzilla_generic_attribution",
+                 "data": {"value": 1, "tags": {"quality": "incomplete"}}},
+                {"type": "Point", "metric": "gridzilla_gateway_requests",
+                 "data": {"value": 1, "tags": {"dimension_region": "west"}}},
+                {"type": "Point", "metric": "gridzilla_gateway_requests",
+                 "data": {"value": 1, "tags": {"dimension_region": "unknown"}}},
+            ]
+            raw.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            result = summarize_raw(raw, {"metrics": {"http_reqs": {"values": {"count": 2}}}},
+                                   minimum_samples=20, required_dimensions=("region",))
+            self.assertEqual(result["attributionStatus"], "partial")
+            self.assertEqual(result["attributedRequests"], 1)
+            self.assertEqual(result["attributionDenominator"], 2)
+            self.assertEqual(result["unattributedRequests"], 1)
+            self.assertEqual(result["genericAttributionCounts"], {"complete": 1, "incomplete": 1})
+            self.assertEqual(result["routeCountsByDimension"], {"region": {"west": 1, "unknown": 1}})
+
+    def test_generic_attribution_is_unavailable_for_old_data_with_required_dimensions(self):
+        result = summarize_raw(Path("/missing/raw.jsonl"), {"metrics": {"http_reqs": {"values": {"count": 2}}}},
+                               minimum_samples=20, required_dimensions=("region",))
+        self.assertEqual(result["attributionStatus"], "unavailable")
+        self.assertIsNone(result["attributedRequests"])
+        self.assertEqual(result["requiredAttributionDimensions"], ["region"])
+
+    def test_legacy_generic_dimensions_recover_partial_site_attribution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = Path(temporary) / "raw.jsonl"
+            rows = [
+                {"type": "Point", "metric": "http_reqs", "data": {"value": 399, "tags": {"status": "200"}}},
+                {"type": "Point", "metric": "http_reqs", "data": {"value": 23, "tags": {"status": "404"}}},
+                {"type": "Point", "metric": "gridzilla_gateway_requests", "data": {"value": 198, "tags": {"dimension_site": "central"}}},
+                {"type": "Point", "metric": "gridzilla_gateway_requests", "data": {"value": 201, "tags": {"dimension_site": "east"}}},
+                {"type": "Point", "metric": "gridzilla_gateway_requests", "data": {"value": 23, "tags": {"dimension_site": "unknown"}}},
+            ]
+            raw.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            result = summarize_raw(raw, {"metrics": {"http_reqs": {"values": {"count": 422}}}},
+                                   minimum_samples=20, required_dimensions=("site",))
+            self.assertEqual(result["attributionStatus"], "partial")
+            self.assertEqual(result["attributedRequests"], 399)
+            self.assertEqual(result["attributionDenominator"], 422)
+            self.assertEqual(result["unattributedRequests"], 23)
+            self.assertAlmostEqual(result["attributionCompleteness"], 399 / 422)
+            self.assertEqual(result["routeCountsByDimension"]["site"],
+                             {"central": 198, "east": 201, "unknown": 23})
+
     def test_direct_reference_is_not_counted_as_missing_gateway_attribution(self):
         with tempfile.TemporaryDirectory() as temporary:
             result = summarize_raw(Path(temporary) / "missing.jsonl", {"metrics": {"http_reqs": {"values": {"count": 7}}}},
                                   minimum_samples=20, reference=True)
-            self.assertEqual(result["attributionDenominator"], 0)
-            self.assertEqual(result["unattributedRequests"], 0)
+            self.assertIsNone(result["attributionDenominator"])
+            self.assertIsNone(result["unattributedRequests"])
 
     def test_current_k6_summary_shape_reports_offered_count_and_http_failure_rate(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -407,7 +461,21 @@ class ResultsTests(unittest.TestCase):
         for name in ("smoke", "baseline", "stepped"):
             profile = load_profile(repo / "profiles" / f"{name}.json")
             self.assertEqual(profile.pressure_target_pool, "pool-a")
-            self.assertLessEqual(profile.max_rate, 50)
+            self.assertLessEqual(profile.max_rate, 100)
+
+    def test_profile_plan_counts_warmup_once_and_matches_traffic_windows(self):
+        repo = Path(__file__).resolve().parents[1]
+        profile = load_profile(repo / "profiles" / "smoke.json")
+        profile = replace(profile, repetitions=3, window="10s", warmup="2s", max_evidence_bytes=100_000_000)
+        plan = plan_profile(profile, scenario="generic", has_reference=False,
+                            rates=(5, 10), request_body_sizes_bytes=(None, 16384))
+        # Two rates x two body sizes produce four specs; each gets three measured
+        # windows and one warmup. Warmup is not appended to each measurement.
+        self.assertEqual(plan["measurementWindowCount"], 12)
+        self.assertEqual(plan["warmupWindowCount"], 4)
+        self.assertEqual(plan["windowCount"], 16)
+        self.assertEqual(plan["durationSeconds"], 128)
+        self.assertEqual(plan["offeredRequests"], 960)
 
     def test_profile_wall_time_cap_includes_each_phase_warmup(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -415,6 +483,8 @@ class ResultsTests(unittest.TestCase):
             raw = json.loads((Path(__file__).resolve().parents[1] / "profiles" / "smoke.json").read_text())
             raw["warmup"] = "100s"
             raw["window"] = "500s"
+            raw["rates"] = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45]
+            raw["requestBodySizesBytes"] = [16384, 32768, 49152, 65536, 81920, 98304]
             path.write_text(json.dumps(raw))
             with self.assertRaisesRegex(ValidationError, "total run duration"):
                 load_profile(path)
@@ -434,6 +504,16 @@ class RevisionAndRecoveryTests(unittest.TestCase):
             still_baseline = minimal_gate(revision="pressured", top="west", target_score=0.3)
             ok, facts = controller._check_signal_gate(handoff, baseline, still_baseline, "west")
             self.assertFalse(ok)
+            pressured_elsewhere = minimal_gate(revision="pressured", top="west", target_score=0.3)
+            for item in pressured_elsewhere["sites"]:
+                item["metrics"]["queue"][0]["value"] = 9 if item["name"] == "central" else 0
+                if item["name"] == "central":
+                    item["overlay"]["candidates"][0]["score"] = 0.3
+            ok, facts = controller._check_signal_gate(handoff, baseline, pressured_elsewhere, "central",
+                                                      require_selection_change=False)
+            self.assertTrue(ok, facts)
+            self.assertFalse(facts["selectionChanged"])
+            self.assertFalse(facts["selectionChangeRequired"])
 
     def test_benchmark_restores_after_failure_during_pressure_convergence(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -488,6 +568,13 @@ class RevisionAndRecoveryTests(unittest.TestCase):
             pressured = minimal_gate(revision="pressured", top="central")
             snapshot = {"pressureSite": "west", "runId": handoff["runId"], "sites": {}}
             restore_result = {"pressureSite": "west", "pods": [{"matchesOriginal": True}], "configRestored": True}
+            progress_updates = []
+
+            def traffic_phase(*_args, on_progress=None, **_kwargs):
+                if on_progress:
+                    on_progress({"action": "window-complete", "index": "test-window",
+                                 "phase": "baseline", "ratePerSecond": 0.2})
+                return []
             recovery = {"selectionRestored": True, "servingRevision": "baseline"}
 
             class DummyTransport:
@@ -498,7 +585,7 @@ class RevisionAndRecoveryTests(unittest.TestCase):
                  patch.object(controller, "doctor", return_value={"ok": True, "problems": []}), \
                  patch.object(controller, "_ready_gate", return_value={"ok": True}), \
                  patch.object(controller, "smoke", return_value={"ok": True}), \
-                 patch.object(controller, "run_traffic_phase", return_value=[]), \
+                 patch.object(controller, "run_traffic_phase", side_effect=traffic_phase), \
                  patch.object(controller, "gate_snapshot", return_value=baseline), \
                  patch.object(controller, "snapshot_simulators", return_value=snapshot), \
                  patch.object(controller, "mutate_simulators", return_value=[{"status": 200}]), \
@@ -507,7 +594,8 @@ class RevisionAndRecoveryTests(unittest.TestCase):
                  patch.object(controller, "wait_for_recovery", return_value=(baseline, recovery)), \
                  patch.object(controller, "send_probe", return_value={"ok": True}), \
                  patch.object(controller, "_capture_diagnostics", return_value=None):
-                result = controller.run_benchmark(handoff, profile, profile_path, root=root / "evidence")
+                result = controller.run_benchmark(handoff, profile, profile_path, root=root / "evidence",
+                                                  operation_id="operation-123", on_progress=progress_updates.append)
 
             run_dir = Path(result["evidenceDirectory"])
             run_result = json.loads((run_dir / "run-result.json").read_text())
@@ -517,6 +605,10 @@ class RevisionAndRecoveryTests(unittest.TestCase):
             self.assertTrue(run_result["restoration"]["verified"])
             self.assertEqual(run_result["restoration"]["recovery"], recovery)
             self.assertEqual(restore_proof, run_result["restoration"])
+            self.assertTrue(progress_updates)
+            self.assertEqual(progress_updates[0]["runId"], run_dir.name)
+            self.assertEqual(progress_updates[0]["scenario"], "grid-llmd-signals")
+            self.assertEqual(progress_updates[0]["expectedWindows"], plan_profile(profile, scenario="grid")["windowCount"])
 
     def test_recovery_nonconvergence_is_recorded_and_fails_run(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -633,16 +725,67 @@ class ReportTests(unittest.TestCase):
             (root / "source-lock.json").write_text(json.dumps({"setupSource": {"revision": "a" * 40}, "runtimeImages": []}))
             (root / "profile.json").write_text(json.dumps({"name": "baseline"}))
             (root / "windows.jsonl").write_text(json.dumps({"type": "measurement", "phase": "baseline", "ratePerSecond": 1,
+                                                             "started": {"utc": "2026-11-10T04:30:00Z"},
                                                              "repeat": 1, "elapsedSeconds": 1,
                                                              "accounting": {"httpRequests": 2, "routeCountsBySite": {"west": 1},
+                                                                            "routeCountsByDimension": {"site": {"region-north": 1},
+                                                                                                      "pool": {"pool-green": 1}},
                                                                             "attributedRequests": 1, "unattributedRequests": 1,
                                                                             "latencyMs": {"p95": {"value": 4}}}}) + "\n")
             (root / "resource-samples.jsonl").write_text(json.dumps({"loadGeneratorSaturated": False}) + "\n")
             value = regenerate_report(root)
             self.assertTrue(value["generatedFromEvidenceOnly"])
             self.assertEqual(value["routeDistributionByWindow"][0]["unattributedRequests"], 1)
+            self.assertEqual(value["routeCountsByDimension"], {
+                "pool": {"pool-green": 1}, "site": {"region-north": 1},
+            })
+            self.assertTrue((root / "charts" / "route-dimensions" / "pool.svg").is_file())
+            self.assertIn("region-north", (root / "report.md").read_text())
             self.assertTrue((root / "charts" / "throughput.svg").is_file())
+            chart = (root / "charts" / "throughput.svg").read_text()
+            self.assertIn("Measurement window (UTC)", chart)
+            self.assertIn("Achieved requests / second", chart)
+            self.assertEqual(value["routeDistributionByWindow"][0]["startedAtUtc"], "2026-11-10T04:30:00Z")
             self.assertIn("unattributed", (root / "report.md").read_text().lower())
+            first_normalized = (root / "normalized-report.json").read_bytes()
+            first_report_data = (root / "report-data.json").read_bytes()
+            first_report = (root / "report.md").read_bytes()
+            second = regenerate_report(root)
+            self.assertEqual(second["evidenceBytesBeforeFinalReport"], value["evidenceBytesBeforeFinalReport"])
+            self.assertEqual((root / "normalized-report.json").read_bytes(), first_normalized)
+            self.assertEqual((root / "report-data.json").read_bytes(), first_report_data)
+            self.assertEqual((root / "report.md").read_bytes(), first_report)
+
+    def test_incomplete_or_failed_run_cannot_claim_throughput(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan = {"windowCount": 2, "measurementWindowCount": 2, "warmupWindowCount": 0}
+            result_path = root / "run-result.json"
+            result = {"status": "PASS", "scenario": "generic-endpoint", "plan": plan}
+            result_path.write_text(json.dumps(result))
+            (root / "source-lock.json").write_text("{}")
+            (root / "profile.json").write_text(json.dumps({"name": "baseline"}))
+            window = {"type": "measurement", "phase": "baseline", "elapsedSeconds": 1,
+                      "accounting": {"httpRequests": 10, "droppedIterations": 0}}
+            windows_path = root / "windows.jsonl"
+            windows_path.write_text(json.dumps(window) + "\n")
+            (root / "resource-samples.jsonl").write_text(json.dumps({"loadGeneratorSaturated": False}) + "\n")
+
+            incomplete = regenerate_report(root)
+            self.assertFalse(incomplete["throughputClaim"]["eligible"])
+            self.assertIn("not all completed", incomplete["throughputClaim"]["reason"])
+
+            windows_path.write_text((json.dumps(window) + "\n") * 2)
+            result["status"] = "FAIL"
+            result_path.write_text(json.dumps(result))
+            failed = regenerate_report(root)
+            self.assertFalse(failed["throughputClaim"]["eligible"])
+            self.assertEqual(failed["throughputClaim"]["reason"], "the benchmark did not pass")
+
+            result["status"] = "PASS"
+            result_path.write_text(json.dumps(result))
+            complete = regenerate_report(root)
+            self.assertTrue(complete["throughputClaim"]["eligible"])
 
     def test_report_recomputes_accounting_from_current_k6_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -674,8 +817,14 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(account["completedIterations"], 3)
             self.assertEqual(account["droppedIterations"], 1)
             self.assertEqual(account["httpFailureRate"], 0.0)
+            self.assertFalse(value["throughputClaim"]["eligible"])
+            self.assertEqual(value["throughputClaim"]["droppedIterationCount"], 1)
+            self.assertIn("k6 dropped 1 iterations", value["throughputClaim"]["reason"])
             report = (root / "report.md").read_text()
-            self.assertIn("| baseline | 0.2 | 15s | 4.0 | 1 | 1 | 0.00", report)
+            self.assertIn("| baseline · Grid | 0.2 | unavailable / unavailable | 15s | 4.0 | 1 | 1 | 0.00", report)
+            p95_chart = (root / "charts" / "latency-p95.svg").read_text()
+            self.assertIn("each window needs 100 latency samples", p95_chart)
+            self.assertIn("1 were saved across 1 windows", p95_chart)
 
     def test_active_benchmark_progress_is_visible_without_exposing_failure_text(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -697,8 +846,21 @@ class ReportTests(unittest.TestCase):
             self.assertNotIn("private-token-must-not-escape", json.dumps(active))
             self.assertEqual(_saved_runs(root)[0]["status"], "RUNNING")
             saved = _saved_run(root, run.name)
-            self.assertEqual(len(saved["windows"]), 1)
+            self.assertEqual(saved["run"]["status"], "RUNNING")
+            windows = [window for phase in saved["measurements"]["phases"] for window in phase["windows"]]
+            self.assertEqual(len(windows), 1)
             self.assertNotIn("private-token-must-not-escape", json.dumps(saved))
+
+    def test_stalled_live_state_read_marks_the_last_snapshot_stale(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = LiveState(None, 3, Path(temporary))
+            state.value = {"status": "LIVE", "observedAtUtc": "2020-01-01T00:00:00Z",
+                           "sites": [{"status": "LIVE", "metrics": {"status": "LIVE"}}]}
+            value = state.read()
+            self.assertEqual(value["status"], "STALE")
+            self.assertEqual(value["sites"][0]["status"], "STALE")
+            self.assertEqual(value["sites"][0]["metrics"]["status"], "STALE")
+            state.close()
 
 
 if __name__ == "__main__":

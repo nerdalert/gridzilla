@@ -1,0 +1,10 @@
+kind: Datasource
+metadata:
+  name: gridzilla-prometheus
+  project: gridzilla
+spec:
+  default: true
+  plugin:
+    kind: PrometheusDatasource
+    spec:
+      directUrl: http://localhost:9090
